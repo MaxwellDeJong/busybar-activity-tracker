@@ -1,0 +1,15 @@
+# The firmware fork is its own repository (github.com/MaxwellDeJong/busybar-firmware).
+busybar-firmware/
+
+# Device recovery bundles — large firmware images. Re-download + SHA-256 verify
+# from https://update.busy.app/busybar-firmware/directory.json (see the plan, §9.2).
+recovery/
+
+# Python bytecode / virtualenvs
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Recorder output: session logs and raw snapshot dumps
+*.jsonl
