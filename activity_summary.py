@@ -15,64 +15,16 @@ on the day it started.
 """
 import argparse
 import datetime as dt
-import json
-import os
 import sys
 
-DAY_CUTOFF_HOUR = 3           # a day runs [03:00, next 03:00) local
-MIN_DURATION_S = 60           # drop sessions shorter than this
-DEFAULT_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "activity_log.jsonl")
-
-
-def parse_day_arg(s):
-    """Parse 'M/D/YY' or 'M/D/YYYY' into a date."""
-    parts = s.strip().split("/")
-    if len(parts) != 3:
-        raise ValueError(f"expected M/D/YY, got {s!r}")
-    month, day, year = (int(p) for p in parts)
-    if year < 100:
-        year += 2000
-    return dt.date(year, month, day)
-
-
-def logical_day(local_dt):
-    """The day a local datetime belongs to, given the 3 AM cutoff."""
-    return (local_dt - dt.timedelta(hours=DAY_CUTOFF_HOUR)).date()
-
-
-def fmt_duration(seconds):
-    s = int(round(seconds))
-    h, rem = divmod(s, 3600)
-    m, sec = divmod(rem, 60)
-    out = ""
-    if h:
-        out += f"{h}h"
-    if h or m:
-        out += f"{m}m"
-    out += f"{sec}s"
-    return out
-
-
-def load_sessions(path):
-    if not os.path.exists(path):
-        sys.exit(f"log file not found: {path}")
-    sessions = []
-    with open(path) as fh:
-        for lineno, line in enumerate(fh, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError as e:
-                print(f"warning: skipping malformed line {lineno}: {e}", file=sys.stderr)
-                continue
-            # ISO-8601 with trailing Z (UTC); convert to local time
-            start_utc = dt.datetime.fromisoformat(rec["start"].replace("Z", "+00:00"))
-            rec["_start_local"] = start_utc.astimezone()
-            rec["_duration_s"] = float(rec.get("duration_s", 0.0))
-            sessions.append(rec)
-    return sessions
+from dashboard_data import (
+    DEFAULT_LOG,
+    MIN_DURATION_S,
+    fmt_duration,
+    load_records,
+    logical_day,
+    parse_day_arg,
+)
 
 
 def render_table(headers, rows, aligns):
@@ -108,14 +60,17 @@ def main():
         except ValueError as e:
             sys.exit(f"bad day argument: {e}")
 
-    sessions = load_sessions(args.log)
+    try:
+        sessions = load_records(args.log)
+    except FileNotFoundError:
+        sys.exit(f"log file not found: {args.log}")
 
     kept = [
         s for s in sessions
-        if logical_day(s["_start_local"]) == target
-        and s["_duration_s"] >= MIN_DURATION_S
+        if logical_day(s["start_local"]) == target
+        and s["duration_s"] >= MIN_DURATION_S
     ]
-    kept.sort(key=lambda s: s["_start_local"])
+    kept.sort(key=lambda s: s["start_local"])
 
     tzname = dt.datetime.now().astimezone().tzname() or "local"
     print(f"Busy Bar — {target:%a %-m/%-d/%Y}  "
@@ -132,9 +87,9 @@ def main():
         if s.get("phase") and s["phase"] not in ("focus",):
             label += f" ({s['phase']})"
         rows.append([
-            s["_start_local"].strftime("%H:%M:%S"),
+            s["start_local"].strftime("%H:%M:%S"),
             label,
-            fmt_duration(s["_duration_s"]),
+            fmt_duration(s["duration_s"]),
         ])
     print("Sessions")
     print(render_table(["start", "activity", "duration"], rows, ["<", "<", ">"]))
@@ -144,7 +99,7 @@ def main():
     counts = {}
     for s in kept:
         cat = "rest" if s.get("phase") == "rest" else s["activity"]
-        totals[cat] = totals.get(cat, 0.0) + s["_duration_s"]
+        totals[cat] = totals.get(cat, 0.0) + s["duration_s"]
         counts[cat] = counts.get(cat, 0) + 1
     trows = [
         [act, str(counts[act]), fmt_duration(totals[act])]
