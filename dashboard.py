@@ -91,7 +91,73 @@ def render_day(df, color_map, mode):
 
 def render_placeholder(view):
     st.info(f"**{view}** view lands in a later milestone. "
-            "Day view is available now — pick it in the sidebar.")
+            "Day and Heatmap views are available now — pick one in the sidebar.")
+
+
+# --------------------------------------------------------------------------- #
+# Heatmap (overview) view                                                     #
+# --------------------------------------------------------------------------- #
+RANGE_PRESETS = {"Last 90 days": 90, "Last 6 months": 182, "Last 12 months": 365, "All": None}
+PRODUCTIVE = "Productive total"
+
+
+def _range_bounds(df, preset):
+    end = today_logical()
+    if RANGE_PRESETS[preset] is None:                 # "All": from first logged day
+        start = min(df["logical_day"])
+    else:
+        start = end - dt.timedelta(days=RANGE_PRESETS[preset] - 1)
+    return start, end
+
+
+def render_heatmap(df, mode):
+    activities = sorted(df["activity"].unique())
+
+    c_range, c_measure = st.columns([1, 1])
+    preset = c_range.selectbox("Range", list(RANGE_PRESETS), index=2)   # default 12 months
+    measure = c_measure.selectbox("Coloring", [PRODUCTIVE] + activities)
+
+    start, end = _range_bounds(df, preset)
+    pivot = dd.range_by_activity(df, start, end)       # day x activity, gaps = 0
+    productive = pivot.sum(axis=1) if not pivot.empty else pivot
+
+    # Selected measure per day (minutes).
+    if measure == PRODUCTIVE:
+        values = productive
+    else:
+        values = pivot[measure] if measure in pivot.columns else productive * 0.0
+
+    st.caption(f"**{start:%-m/%-d/%Y} → {end:%-m/%-d/%Y}** · coloring: {measure} "
+               "· each cell = one day (03:00→03:00) · click a day is coming in the next milestone")
+
+    # Summary stats over the range. The average counts only days with activity.
+    total_min = float(values.sum())
+    active_days = int((values > 0).sum())
+    avg_min = total_min / active_days if active_days else 0.0
+    busiest = values.idxmax() if active_days else None
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total in range", dd.fmt_duration(total_min * 60))
+    m2.metric("Avg / active day", dd.fmt_duration(avg_min * 60) if active_days else "—")
+    m3.metric("Active days", active_days)
+    m4.metric("Busiest day", f"{busiest:%-m/%-d}" if busiest is not None else "—",
+              dd.fmt_duration(values.max() * 60) if active_days else None)
+
+    # Per-day hover: date, productive total, per-activity breakdown.
+    hover = {}
+    for day in values.index:
+        parts = [f"<b>{day:%a %-m/%-d/%Y}</b>",
+                 f"Productive: {dd.fmt_duration(float(productive.get(day, 0.0)) * 60)}"]
+        breakdown = sorted(
+            ((a, pivot.loc[day, a]) for a in activities if a in pivot.columns and pivot.loc[day, a] > 0),
+            key=lambda kv: -kv[1],
+        )
+        parts += [f"{a}: {dd.fmt_duration(v * 60)}" for a, v in breakdown]
+        if len(parts) == 2:
+            parts.append("<i>no activity</i>")
+        hover[day] = "<br>".join(parts)
+
+    st.plotly_chart(viz.build_heatmap(values, hover, start, end, mode, unit="hr"),
+                    width="stretch", theme=None)
 
 
 # --------------------------------------------------------------------------- #
@@ -122,6 +188,8 @@ def main():
 
     if view == "Day":
         render_day(df, color_map, mode)
+    elif view == "Heatmap":
+        render_heatmap(df, mode)
     else:
         render_placeholder(view)
 

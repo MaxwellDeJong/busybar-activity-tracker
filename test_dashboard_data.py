@@ -182,5 +182,32 @@ class RealLogSanityTests(unittest.TestCase):
         self.assertAlmostEqual(prod.loc[D21], expect_min, places=6)
 
 
+class HeatmapGridTests(unittest.TestCase):
+    def test_calendar_grid_aligns_to_monday(self):
+        import dashboard_viz as viz
+        # 7/22/26 is a Wednesday -> grid starts on Monday 7/20; 7/20..8/2 = 2 weeks.
+        grid_start, num_weeks = viz.calendar_grid(D22, dt.date(2026, 8, 2))
+        self.assertEqual(grid_start, dt.date(2026, 7, 20))
+        self.assertEqual(grid_start.weekday(), 0)
+        self.assertEqual(num_weeks, 2)
+
+    def test_build_heatmap_places_values(self):
+        import pandas as pd
+        import dashboard_viz as viz
+        start, end = D20, dt.date(2026, 8, 2)   # Mon .. Sun, 2 weeks
+        values = pd.Series({D20: 30.0, D22: 120.0})   # minutes; Mon wk0, Wed wk0
+        hover = {D20: "mon", D22: "wed"}
+        fig = viz.build_heatmap(values, hover, start, end, "light")
+        self.assertEqual(len(fig.data), 1)
+        z = fig.data[0].z
+        self.assertEqual(len(z), 7)              # 7 weekday rows
+        self.assertEqual(len(z[0]), 2)           # 2 week columns
+        # z is shown in hours (minutes / 60)
+        self.assertAlmostEqual(z[0][0], 0.5)     # Mon, week 0 -> 30 min = 0.5 h
+        self.assertAlmostEqual(z[2][0], 2.0)     # Wed, week 0 -> 120 min = 2 h
+        # a day inside the range but with no value is 0.0, not None
+        self.assertEqual(z[1][0], 0.0)           # Tue 7/21, in range, no value
+
+
 if __name__ == "__main__":
     unittest.main()
