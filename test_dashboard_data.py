@@ -143,6 +143,30 @@ class PipelineTests(unittest.TestCase):
         self.assertAlmostEqual(rng.loc[D22].sum(), 0.0)     # gap day all zeros
         self.assertAlmostEqual(rng.loc[D21, "work"], 5.0)
 
+    def test_week_bounds(self):
+        # 7/21/26 is a Tuesday -> Mon 7/20 .. Sun 7/26.
+        self.assertEqual(dd.week_bounds(D21), (D20, dt.date(2026, 7, 26)))
+        self.assertEqual(dd.week_bounds(D20)[0], D20)          # Monday maps to itself
+        self.assertEqual(dd.week_bounds("7/26/26"), (D20, dt.date(2026, 7, 26)))
+        mon, sun = dd.week_bounds(D21)
+        self.assertEqual((sun - mon).days, 6)
+
+    def test_month_bounds(self):
+        self.assertEqual(dd.month_bounds(D21), (dt.date(2026, 7, 1), dt.date(2026, 7, 31)))
+        # December rolls the year over when finding the next month.
+        self.assertEqual(dd.month_bounds(dt.date(2026, 12, 15)),
+                         (dt.date(2026, 12, 1), dt.date(2026, 12, 31)))
+        # February 2028 is a leap year -> 29 days.
+        self.assertEqual(dd.month_bounds(dt.date(2028, 2, 10))[1], dt.date(2028, 2, 29))
+
+    def test_range_sessions(self):
+        wk = dd.range_sessions(self.df, D20, D22)
+        self.assertEqual(len(wk), 4)                          # every kept session
+        starts = list(wk["start_local"])
+        self.assertEqual(starts, sorted(starts))              # sorted by start
+        self.assertEqual(len(dd.range_sessions(self.df, D21, D21)), 3)  # single day
+        self.assertTrue(dd.range_sessions(self.df, D22, D22).empty)     # empty day
+
 
 class EmptyFrameTests(unittest.TestCase):
     def test_prepare_empty(self):
@@ -220,6 +244,30 @@ class HeatmapGridTests(unittest.TestCase):
         self.assertAlmostEqual(cell[(0, 0)], 0.5)   # Mon, week 0 -> 30 min = 0.5 h
         self.assertAlmostEqual(cell[(0, 2)], 2.0)   # Wed, week 0 -> 120 min = 2 h
         self.assertEqual(cell[(0, 1)], 0.0)         # Tue 7/21, in range, no value
+
+
+class StackedBarTests(unittest.TestCase):
+    def test_build_stacked_daily_places_segments(self):
+        import pandas as pd
+        import dashboard_viz as viz
+        import dashboard_theme as theme
+        # Two days, two activities; one gap-ish cell is zero.
+        pivot = pd.DataFrame(
+            {"development": [5.0, 0.0], "work": [5.0, 10.0]},
+            index=[D20, D21],
+        )
+        colors = theme.activity_colors(pivot.columns, "light")
+        fig = viz.build_stacked_daily(pivot, colors, "light", xlabel_fmt="%a %-m/%-d")
+        # One trace per activity, stacked.
+        self.assertEqual(fig.layout.barmode, "stack")
+        self.assertEqual({t.name for t in fig.data}, {"development", "work"})
+        work = next(t for t in fig.data if t.name == "work")
+        self.assertEqual(list(work.y), [5.0, 10.0])
+        # customdata[0] carries the ISO day for click-to-drill.
+        self.assertEqual(work.customdata[0][0], D20.isoformat())
+        self.assertEqual(work.customdata[1][0], D21.isoformat())
+        # <=4 visible activities are direct-labeled on their peak day only.
+        self.assertEqual(list(work.text), ["", "work"])
 
 
 if __name__ == "__main__":

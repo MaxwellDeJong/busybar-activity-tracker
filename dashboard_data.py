@@ -194,7 +194,8 @@ def day_sessions(df, day):
 def range_by_activity(df, start, end):
     """`daily_by_activity` sliced to logical days in [start, end] (inclusive),
     reindexed to a continuous daily calendar so gap days appear as all-zero rows
-    (the heatmap needs every day present). ``start``/``end`` are datetime.date.
+    (the heatmap and stacked-bar views need every day present). ``start``/``end``
+    are datetime.date.
     """
     import pandas as pd
     pivot = daily_by_activity(df)
@@ -203,3 +204,44 @@ def range_by_activity(df, start, end):
         return pd.DataFrame(index=pd.Index(full_index, name="logical_day"))
     sliced = pivot[(pivot.index >= start) & (pivot.index <= end)]
     return sliced.reindex(full_index, fill_value=0.0).rename_axis("logical_day")
+
+
+def week_bounds(day):
+    """Monday..Sunday of the week containing ``day`` (both datetime.date).
+
+    Weeks are Mon-Sun to match the heatmap's row layout. ``day`` may be a date or a
+    'M/D/YY' string.
+    """
+    if isinstance(day, str):
+        day = parse_day_arg(day)
+    monday = day - dt.timedelta(days=day.weekday())
+    return monday, monday + dt.timedelta(days=6)
+
+
+def month_bounds(day):
+    """First..last calendar day of the month containing ``day`` (both date).
+
+    ``day`` may be a date or a 'M/D/YY' string.
+    """
+    if isinstance(day, str):
+        day = parse_day_arg(day)
+    first = day.replace(day=1)
+    nxt = first.replace(year=first.year + 1, month=1) if first.month == 12 \
+        else first.replace(month=first.month + 1)
+    return first, nxt - dt.timedelta(days=1)
+
+
+def range_sessions(df, start, end):
+    """All sessions whose logical_day falls in [start, end], sorted by start time.
+
+    The multi-day analogue of `day_sessions`, used for week/month aggregate tables.
+    ``start``/``end`` may be dates or 'M/D/YY' strings.
+    """
+    if isinstance(start, str):
+        start = parse_day_arg(start)
+    if isinstance(end, str):
+        end = parse_day_arg(end)
+    if df is None or df.empty:
+        return _empty_prepared()
+    sel = df[(df["logical_day"] >= start) & (df["logical_day"] <= end)]
+    return sel.sort_values("start_local").reset_index(drop=True)
