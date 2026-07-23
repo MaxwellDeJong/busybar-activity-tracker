@@ -191,6 +191,18 @@ class HeatmapGridTests(unittest.TestCase):
         self.assertEqual(grid_start.weekday(), 0)
         self.assertEqual(num_weeks, 2)
 
+    def test_date_from_cell_roundtrips(self):
+        import dashboard_viz as viz
+        start, end = D22, dt.date(2026, 9, 30)
+        grid_start, num_weeks = viz.calendar_grid(start, end)
+        # Every day in range maps to a (col, row) that inverts back to the same day.
+        day = start
+        while day <= end:
+            col = (day - grid_start).days // 7
+            row = day.weekday()
+            self.assertEqual(viz.date_from_cell(grid_start, col, row), day)
+            day += dt.timedelta(days=1)
+
     def test_build_heatmap_places_values(self):
         import pandas as pd
         import dashboard_viz as viz
@@ -199,14 +211,15 @@ class HeatmapGridTests(unittest.TestCase):
         hover = {D20: "mon", D22: "wed"}
         fig = viz.build_heatmap(values, hover, start, end, "light")
         self.assertEqual(len(fig.data), 1)
-        z = fig.data[0].z
-        self.assertEqual(len(z), 7)              # 7 weekday rows
-        self.assertEqual(len(z[0]), 2)           # 2 week columns
-        # z is shown in hours (minutes / 60)
-        self.assertAlmostEqual(z[0][0], 0.5)     # Mon, week 0 -> 30 min = 0.5 h
-        self.assertAlmostEqual(z[2][0], 2.0)     # Wed, week 0 -> 120 min = 2 h
-        # a day inside the range but with no value is 0.0, not None
-        self.assertEqual(z[1][0], 0.0)           # Tue 7/21, in range, no value
+        m = fig.data[0]
+        # One clickable square marker per calendar day in range (14 days).
+        self.assertEqual(m.mode, "markers")
+        self.assertEqual(len(m.x), 14)
+        cell = {(x, y): c for x, y, c in zip(m.x, m.y, m.marker.color)}
+        # color is shown in hours (minutes / 60), positioned by (week col, weekday row)
+        self.assertAlmostEqual(cell[(0, 0)], 0.5)   # Mon, week 0 -> 30 min = 0.5 h
+        self.assertAlmostEqual(cell[(0, 2)], 2.0)   # Wed, week 0 -> 120 min = 2 h
+        self.assertEqual(cell[(0, 1)], 0.0)         # Tue 7/21, in range, no value
 
 
 if __name__ == "__main__":
