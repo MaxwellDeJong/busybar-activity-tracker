@@ -1,0 +1,4 @@
+# Dashboard dependencies (activity_summary.py / dashboard_data.py core need only pandas).
+streamlit
+plotly
+pandas
