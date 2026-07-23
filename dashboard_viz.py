@@ -103,29 +103,40 @@ def calendar_grid(start, end):
     return grid_start, num_weeks
 
 
+def date_from_cell(grid_start, col, row):
+    """Inverse of the grid mapping: (week column, weekday row) -> calendar date.
+
+    `grid_start` is the Monday returned by `calendar_grid`. Used to turn a clicked
+    heatmap cell back into the logical day it represents.
+    """
+    return grid_start + dt.timedelta(days=7 * col + row)
+
+
 def build_heatmap(values, hover_text, start, end, mode="light", unit="hr"):
     """GitHub-contributions heatmap: columns = weeks, rows = weekday (Mon top).
 
     `values` is a date->float mapping in **minutes** (the selected measure) for
     every day in [start, end]; in-range days with no activity are 0 (near-zero
-    step), while padding cells outside the range are blank. `hover_text` is
-    date->html string. Cells are colored on the single-hue blue sequential ramp;
-    the z-values (and colorbar) are shown in hours for readability.
+    step). `hover_text` is date->html string.
+
+    Rendered as square **scatter markers** (one per day) rather than a Heatmap
+    trace: markers emit point-selection events, so cells are clickable for
+    drill-down (Heatmap traces are not selectable). Marker color encodes magnitude
+    on the single-hue blue ramp; color/colorbar are shown in hours for readability.
     """
     ink = theme.INK[mode]
     grid_start, num_weeks = calendar_grid(start, end)
 
-    z = [[None] * num_weeks for _ in range(7)]
-    text = [[""] * num_weeks for _ in range(7)]
+    xs, ys, colors, texts = [], [], [], []
     day = start
     while day <= end:
-        col = (day - grid_start).days // 7
-        row = day.weekday()
-        z[row][col] = float(values.get(day, 0.0)) / 60.0     # minutes -> hours for coloring
-        text[row][col] = hover_text.get(day, day.strftime("%a %-m/%-d/%Y"))
+        xs.append((day - grid_start).days // 7)      # week column
+        ys.append(day.weekday())                     # weekday row (Mon=0)
+        colors.append(float(values.get(day, 0.0)) / 60.0)   # minutes -> hours
+        texts.append(hover_text.get(day, day.strftime("%a %-m/%-d/%Y")))
         day += dt.timedelta(days=1)
 
-    zmax = max((v for r in z for v in r if v is not None), default=0.0) or 1.0
+    cmax = max(colors, default=0.0) or 1.0
     # Sequential ramp must recede toward the mode's surface: on light, near-zero is
     # the lightest step; on dark, near-zero is the darkest (near-surface) step and
     # high values brighten. So the ramp direction is mode-aware, not an auto-flip.
@@ -142,20 +153,25 @@ def build_heatmap(values, hover_text, start, end, mode="light", unit="hr"):
             ticktext.append(mon.strftime("%b"))
             prev_month = mon.month
 
-    fig = go.Figure(go.Heatmap(
-        z=z, text=text, x=list(range(num_weeks)), y=list(range(7)),
-        colorscale=colorscale, zmin=0, zmax=zmax, xgap=3, ygap=3,
-        hovertemplate="%{text}<extra></extra>",
-        colorbar=dict(title=unit, outlinewidth=0, thickness=12,
-                      tickfont=dict(color=ink["muted"])),
+    fig = go.Figure(go.Scatter(
+        x=xs, y=ys, mode="markers", customdata=texts,
+        marker=dict(
+            symbol="square", size=15,
+            color=colors, colorscale=colorscale, cmin=0, cmax=cmax,
+            showscale=True, line=dict(width=0),
+            colorbar=dict(title=unit, outlinewidth=0, thickness=12,
+                          tickfont=dict(color=ink["muted"])),
+        ),
+        hovertemplate="%{customdata}<extra></extra>",
     ))
     fig.update_layout(height=210, showlegend=False)
     fig.update_xaxes(tickvals=tickvals, ticktext=ticktext, showgrid=False,
-                     zeroline=False, ticks="", side="top")
+                     zeroline=False, ticks="", side="top",
+                     range=[-0.6, num_weeks - 0.4])
     fig.update_yaxes(tickvals=list(range(7)), ticktext=_WEEKDAYS, showgrid=False,
-                     zeroline=False, ticks="", autorange="reversed")
+                     zeroline=False, ticks="", range=[6.6, -0.6])   # Mon (row 0) on top
     fig = theme.apply_theme(fig, mode)
-    # Heatmap has no bars/lines; keep axis lines invisible for the calendar look.
+    # Calendar look: no visible axis lines.
     fig.update_xaxes(linecolor="rgba(0,0,0,0)")
     fig.update_yaxes(linecolor="rgba(0,0,0,0)")
     return fig

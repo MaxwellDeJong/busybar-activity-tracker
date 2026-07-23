@@ -101,6 +101,14 @@ RANGE_PRESETS = {"Last 90 days": 90, "Last 6 months": 182, "Last 12 months": 365
 PRODUCTIVE = "Productive total"
 
 
+def _selected_points(event):
+    """Extract clicked points from a plotly on_select event, robust to shape."""
+    try:
+        return event["selection"]["points"] or []
+    except (TypeError, KeyError):
+        return []
+
+
 def _range_bounds(df, preset):
     end = today_logical()
     if RANGE_PRESETS[preset] is None:                 # "All": from first logged day
@@ -128,7 +136,7 @@ def render_heatmap(df, mode):
         values = pivot[measure] if measure in pivot.columns else productive * 0.0
 
     st.caption(f"**{start:%-m/%-d/%Y} → {end:%-m/%-d/%Y}** · coloring: {measure} "
-               "· each cell = one day (03:00→03:00) · click a day is coming in the next milestone")
+               "· each cell = one day (03:00→03:00) · **click a day to open it**")
 
     # Summary stats over the range. The average counts only days with activity.
     total_min = float(values.sum())
@@ -156,8 +164,26 @@ def render_heatmap(df, mode):
             parts.append("<i>no activity</i>")
         hover[day] = "<br>".join(parts)
 
-    st.plotly_chart(viz.build_heatmap(values, hover, start, end, mode, unit="hr"),
-                    width="stretch", theme=None)
+    # Click-to-drill: capture a cell click, map it back to its logical day, and
+    # switch to the Day view. The Day view's own date picker is the fallback.
+    grid_start, _ = viz.calendar_grid(start, end)
+    event = st.plotly_chart(
+        viz.build_heatmap(values, hover, start, end, mode, unit="hr"),
+        width="stretch", theme=None, key="heatmap_select",
+        on_select="rerun", selection_mode="points",
+    )
+    points = _selected_points(event)
+    if points:
+        p = points[0]
+        token = (int(round(p["x"])), int(round(p["y"])))
+        # Guard against re-processing a replayed selection (avoids a nav loop).
+        if st.session_state.get("_hm_token") != token:
+            st.session_state._hm_token = token
+            clicked = viz.date_from_cell(grid_start, token[0], token[1])
+            if start <= clicked <= end:
+                st.session_state.day = clicked
+                st.session_state.view = "Day"
+                st.rerun()
 
 
 # --------------------------------------------------------------------------- #
@@ -166,9 +192,15 @@ def render_heatmap(df, mode):
 def main():
     st.title("Busy Bar — Activity Dashboard")
 
+    # View is session-backed so a heatmap-cell click can switch it programmatically.
+    st.session_state.setdefault("view", "Day")
     with st.sidebar:
         st.header("View")
-        view = st.radio("View", VIEWS, label_visibility="collapsed")
+        # No widget key: the index tracks session_state.view, and we store the
+        # user's choice back — this lets a click set the view without a state clash.
+        view = st.radio("View", VIEWS, index=VIEWS.index(st.session_state.view),
+                        label_visibility="collapsed")
+        st.session_state.view = view
         st.header("Appearance")
         mode = st.radio("Theme", ["light", "dark"], label_visibility="collapsed",
                         format_func=str.capitalize)
