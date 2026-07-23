@@ -86,6 +86,57 @@ def build_activity_totals(sessions, color_map, mode="light"):
 
 
 # --------------------------------------------------------------------------- #
+# Stacked daily bars (Week / Month)                                           #
+# --------------------------------------------------------------------------- #
+def build_stacked_daily(pivot, color_map, mode="light", xlabel_fmt="%-d"):
+    """Stacked daily bars: one bar per day in ``pivot.index``, stacked by activity.
+
+    ``pivot`` is a day x activity frame of **minutes** (see `range_by_activity`),
+    already sliced to the target week/month with all-zero activity columns dropped.
+    Both the Week and Month views share this form. Each bar segment carries its ISO
+    day in ``customdata[0]`` so a click can drill into the Day view. When 4 or fewer
+    activities are visible they are also direct-labeled on their tallest day, so
+    identity is never carried by color alone; the legend is always present.
+    """
+    ink = theme.INK[mode]
+    days = list(pivot.index)
+    labels = [d.strftime(xlabel_fmt) for d in days]
+    activities = list(pivot.columns)          # alphabetical -> stable stack + colors
+    direct = len(activities) <= 4
+
+    fig = go.Figure()
+    for activity in activities:
+        vals = [float(v) for v in pivot[activity].values]
+        customdata = [
+            [d.isoformat(), d.strftime("%a %-m/%-d"), dd.fmt_duration(v * 60.0)]
+            for d, v in zip(days, vals)
+        ]
+        text = None
+        if direct and vals:
+            top = max(range(len(vals)), key=lambda i: vals[i])   # this activity's peak day
+            text = [activity if (i == top and vals[i] > 0) else "" for i in range(len(vals))]
+        fig.add_bar(
+            name=activity, x=labels, y=vals,
+            marker=dict(color=color_map.get(activity, theme.OTHER_COLOR),
+                        line=dict(width=2, color=ink["surface"])),   # 2px surface gap
+            customdata=customdata,
+            text=text, textposition="inside", insidetextanchor="middle",
+            textfont=dict(color="#ffffff"),
+            hovertemplate="<b>%{fullData.name}</b><br>%{customdata[1]}"
+                          "<br>%{customdata[2]}<extra></extra>",
+        )
+
+    fig.update_layout(
+        barmode="stack", bargap=0.28, height=380, showlegend=True,
+        uniformtext=dict(mode="hide", minsize=8),   # drop direct labels that don't fit
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+    )
+    fig.update_xaxes(title=None, type="category", showgrid=False)
+    fig.update_yaxes(title="minutes", rangemode="tozero")
+    return theme.apply_theme(fig, mode)
+
+
+# --------------------------------------------------------------------------- #
 # Heatmap (overview)                                                          #
 # --------------------------------------------------------------------------- #
 _WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
