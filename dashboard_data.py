@@ -28,7 +28,9 @@ import sys
 
 DAY_CUTOFF_HOUR = 3           # a day runs [03:00, next 03:00) local
 MIN_DURATION_S = 60           # drop sessions shorter than this
-DEFAULT_LOG = os.path.join(os.path.dirname(os.path.abspath(__file__)), "activity_log.jsonl")
+_HERE = os.path.dirname(os.path.abspath(__file__))
+DEFAULT_LOG = os.path.join(_HERE, "activity_log.jsonl")
+DEFAULT_CARD_MAP = os.path.join(_HERE, "activity_card_id_map.json")
 
 
 # --------------------------------------------------------------------------- #
@@ -50,8 +52,19 @@ def logical_day(local_dt):
     return (local_dt - dt.timedelta(hours=DAY_CUTOFF_HOUR)).date()
 
 
-def fmt_duration(seconds):
-    """Human-readable duration, e.g. '1h05m30s' / '5m02s' / '42s'."""
+def fmt_duration(seconds, precision="second"):
+    """Human-readable duration.
+
+    ``precision="second"`` (the CLI default) keeps seconds: '1h5m30s' / '5m2s' /
+    '42s'. ``precision="minute"`` rounds to the nearest minute and drops the seconds
+    field — '4h34m' / '43m' — the right altitude for the dashboard's aggregates and
+    hovers, where second-level detail is just noise.
+    """
+    if precision == "minute":
+        total_min = int(round(seconds / 60.0))
+        h, m = divmod(total_min, 60)
+        return f"{h}h{m:02d}m" if h else f"{m}m"
+
     s = int(round(seconds))
     h, rem = divmod(s, 3600)
     m, sec = divmod(rem, 60)
@@ -62,6 +75,15 @@ def fmt_duration(seconds):
         out += f"{m}m"
     out += f"{sec}s"
     return out
+
+
+def load_card_map(path=DEFAULT_CARD_MAP):
+    """Load the card_id -> activity-name map. Returns {} if the file is missing so
+    callers degrade to the raw ``activity`` field rather than crashing."""
+    if not os.path.exists(path):
+        return {}
+    with open(path) as fh:
+        return json.load(fh)
 
 
 def load_records(path=DEFAULT_LOG):
@@ -76,6 +98,7 @@ def load_records(path=DEFAULT_LOG):
     """
     if not os.path.exists(path):
         raise FileNotFoundError(path)
+    card_map = load_card_map()
     records = []
     with open(path) as fh:
         for lineno, line in enumerate(fh, 1):
@@ -91,6 +114,11 @@ def load_records(path=DEFAULT_LOG):
             start_utc = dt.datetime.fromisoformat(rec["start"].replace("Z", "+00:00"))
             rec["start_local"] = start_utc.astimezone()
             rec["duration_s"] = float(rec.get("duration_s", 0.0))
+            # Resolve a friendly activity name via the card map. The recorder writes
+            # the raw card_id as `activity` for any card missing from the map, so
+            # prefer the map's name, then the record's own label, then the raw id.
+            cid = rec.get("card_id")
+            rec["activity"] = card_map.get(cid) or rec.get("activity") or cid
             records.append(rec)
     return records
 

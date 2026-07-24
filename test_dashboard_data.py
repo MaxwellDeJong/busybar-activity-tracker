@@ -233,7 +233,7 @@ class HeatmapGridTests(unittest.TestCase):
         start, end = D20, dt.date(2026, 8, 2)   # Mon .. Sun, 2 weeks
         values = pd.Series({D20: 30.0, D22: 120.0})   # minutes; Mon wk0, Wed wk0
         hover = {D20: "mon", D22: "wed"}
-        fig = viz.build_heatmap(values, hover, start, end, "light")
+        fig = viz.build_heatmap(values, hover, start, end)
         self.assertEqual(len(fig.data), 1)
         m = fig.data[0]
         # One clickable square marker per calendar day in range (14 days).
@@ -256,8 +256,8 @@ class StackedBarTests(unittest.TestCase):
             {"development": [5.0, 0.0], "work": [5.0, 10.0]},
             index=[D20, D21],
         )
-        colors = theme.activity_colors(pivot.columns, "light")
-        fig = viz.build_stacked_daily(pivot, colors, "light", xlabel_fmt="%a %-m/%-d")
+        colors = theme.activity_colors(pivot.columns)
+        fig = viz.build_stacked_daily(pivot, colors, xlabel_fmt="%a %-m/%-d")
         # One trace per activity, stacked.
         self.assertEqual(fig.layout.barmode, "stack")
         self.assertEqual({t.name for t in fig.data}, {"development", "work"})
