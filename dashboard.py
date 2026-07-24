@@ -5,7 +5,8 @@ Run with:  streamlit run dashboard.py
 All four views are live: Day (timeline + per-activity totals), Heatmap (overview
 with click-to-drill), and Week / Month (stacked daily bars + a week aggregate
 table). The heavy lifting (loading, filtering, shaping) lives in dashboard_data;
-figures in dashboard_viz. Only Polish (milestone 6) remains.
+figures in dashboard_viz; palette + Plotly theming in dashboard_theme. A sidebar
+Light/Dark radio drives the chart theme.
 """
 from __future__ import annotations
 
@@ -21,6 +22,39 @@ import dashboard_viz as viz
 st.set_page_config(page_title="Busy Bar", page_icon="📊", layout="wide")
 
 VIEWS = ["Day", "Week", "Month", "Heatmap"]
+
+# Charts own their own theming (dashboard_theme), so Streamlit must not re-skin them.
+# The modebar is hidden — this is a read/click dashboard, not a Plotly editor; cells
+# and bars stay clickable for drill-down without it.
+PLOTLY_CONFIG = {"displayModeBar": False, "scrollZoom": False}
+
+# Layout-only CSS (no colors — Streamlit's own theme owns those): tighten
+# the default padding, centre the content, and give the stat tiles a quiet, uniform
+# label/value rhythm so they read as a designed row rather than raw st.metric output.
+_CSS = """
+<style>
+  [data-testid="stMainBlockContainer"] {
+    max-width: 1180px;
+    padding-top: 2.6rem;
+    padding-bottom: 4rem;
+  }
+  h1 { font-weight: 660; letter-spacing: -0.021em; }
+  [data-testid="stMetric"] { padding: 0.7rem 1rem 0.8rem; border-radius: 0.6rem; }
+  [data-testid="stMetricLabel"] p {
+    font-size: 0.72rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.05em; opacity: 0.62;
+  }
+  [data-testid="stMetricValue"] { font-size: 1.55rem; font-weight: 600; }
+  [data-testid="stMetricDelta"] { font-size: 0.8rem; }
+  /* Section labels above each chart: smaller and calmer than a default subheader. */
+  h3 { font-size: 0.95rem; font-weight: 600; letter-spacing: 0.01em; margin: 0.4rem 0 0.2rem; }
+  section[data-testid="stSidebar"] h2 {
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.6;
+  }
+</style>
+"""
+
+
 
 
 # --------------------------------------------------------------------------- #
@@ -45,19 +79,19 @@ def today_logical():
 # --------------------------------------------------------------------------- #
 # Day view                                                                    #
 # --------------------------------------------------------------------------- #
-def render_day(df, color_map, mode):
+def render_day(df, color_map):
     if "day" not in st.session_state:
         st.session_state.day = today_logical()
 
     # Navigation row.
     c_prev, c_today, c_next, c_pick = st.columns([1, 1, 1, 4])
-    if c_prev.button("◀ Prev", width="stretch"):
+    if c_prev.button("Prev", icon=":material/chevron_left:", width="stretch"):
         st.session_state.day -= dt.timedelta(days=1)
         st.rerun()
-    if c_today.button("Today", width="stretch"):
+    if c_today.button("Today", icon=":material/today:", width="stretch"):
         st.session_state.day = today_logical()
         st.rerun()
-    if c_next.button("Next ▶", width="stretch"):
+    if c_next.button("Next", icon=":material/chevron_right:", width="stretch"):
         st.session_state.day += dt.timedelta(days=1)
         st.rerun()
     picked = c_pick.date_input("Day", value=st.session_state.day, label_visibility="collapsed")
@@ -77,17 +111,17 @@ def render_day(df, color_map, mode):
     # Headline stats.
     total_s = float(sessions["duration_s"].sum())
     m1, m2, m3 = st.columns(3)
-    m1.metric("Productive total", dd.fmt_duration(total_s))
-    m2.metric("Sessions", len(sessions))
-    m3.metric("Activities", sessions["activity"].nunique())
+    m1.metric("Productive total", dd.fmt_duration(total_s, "minute"), border=True)
+    m2.metric("Sessions", len(sessions), border=True)
+    m3.metric("Activities", sessions["activity"].nunique(), border=True)
 
     # Timeline (primary) + totals (secondary).
     st.subheader("Timeline")
-    st.plotly_chart(viz.build_day_timeline(sessions, day, color_map, mode),
-                    width="stretch", theme=None)
+    st.plotly_chart(viz.build_day_timeline(sessions, day, color_map),
+                    width="stretch", theme=None, config=PLOTLY_CONFIG)
     st.subheader("Total per activity")
-    st.plotly_chart(viz.build_activity_totals(sessions, color_map, mode),
-                    width="stretch", theme=None)
+    st.plotly_chart(viz.build_activity_totals(sessions, color_map),
+                    width="stretch", theme=None, config=PLOTLY_CONFIG)
 
 
 # --------------------------------------------------------------------------- #
@@ -130,8 +164,8 @@ def _totals_table(pivot, sessions):
     return {
         "activity": list(totals.index) + ["TOTAL"],
         "sessions": [int(counts.get(a, 0)) for a in totals.index] + [len(sessions)],
-        "total": [dd.fmt_duration(v * 60.0) for v in totals.values]
-                 + [dd.fmt_duration(grand * 60.0)],
+        "total": [dd.fmt_duration(v * 60.0, "minute") for v in totals.values]
+                 + [dd.fmt_duration(grand * 60.0, "minute")],
     }
 
 
@@ -146,18 +180,18 @@ def _scoped_pivot(df, start, end):
     return pivot, total
 
 
-def render_week(df, color_map, mode):
+def render_week(df, color_map):
     if "week" not in st.session_state:
         st.session_state.week = dd.week_bounds(today_logical())[0]
 
     c_prev, c_this, c_next, c_pick = st.columns([1, 1, 1, 4])
-    if c_prev.button("◀ Prev", width="stretch", key="wk_prev"):
+    if c_prev.button("Prev", icon=":material/chevron_left:", width="stretch", key="wk_prev"):
         st.session_state.week -= dt.timedelta(days=7)
         st.rerun()
-    if c_this.button("This week", width="stretch", key="wk_this"):
+    if c_this.button("This week", icon=":material/today:", width="stretch", key="wk_this"):
         st.session_state.week = dd.week_bounds(today_logical())[0]
         st.rerun()
-    if c_next.button("Next ▶", width="stretch", key="wk_next"):
+    if c_next.button("Next", icon=":material/chevron_right:", width="stretch", key="wk_next"):
         st.session_state.week += dt.timedelta(days=7)
         st.rerun()
     picked = c_pick.date_input("Week", value=st.session_state.week,
@@ -180,15 +214,16 @@ def render_week(df, color_map, mode):
     active_days = int((pivot.sum(axis=1) > 0).sum())
     avg_min = total_min / active_days if active_days else 0.0    # avg over active days
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Productive total", dd.fmt_duration(total_min * 60.0))
-    m2.metric("Avg / active day", dd.fmt_duration(avg_min * 60.0) if active_days else "—")
-    m3.metric("Active days", f"{active_days} / 7")
-    m4.metric("Activities", pivot.shape[1])
+    m1.metric("Productive total", dd.fmt_duration(total_min * 60.0, "minute"), border=True)
+    m2.metric("Avg / active day", dd.fmt_duration(avg_min * 60.0, "minute") if active_days else "—",
+              border=True)
+    m3.metric("Active days", f"{active_days} / 7", border=True)
+    m4.metric("Activities", pivot.shape[1], border=True)
 
     st.subheader("Daily activity")
     event = st.plotly_chart(
-        viz.build_stacked_daily(pivot, color_map, mode, xlabel_fmt="%a %-m/%-d"),
-        width="stretch", theme=None, key="week_bars",
+        viz.build_stacked_daily(pivot, color_map, xlabel_fmt="%a %-m/%-d"),
+        width="stretch", theme=None, key="week_bars", config=PLOTLY_CONFIG,
         on_select="rerun", selection_mode="points",
     )
     _drill_from_bar(event, "week", monday, sunday)
@@ -197,27 +232,27 @@ def render_week(df, color_map, mode):
     c_bar, c_tbl = st.columns([3, 2])
     with c_bar:
         st.subheader("Total per activity")
-        st.plotly_chart(viz.build_activity_totals(week_sessions, color_map, mode),
-                        width="stretch", theme=None)
+        st.plotly_chart(viz.build_activity_totals(week_sessions, color_map),
+                        width="stretch", theme=None, config=PLOTLY_CONFIG)
     with c_tbl:
         st.subheader("Breakdown")
         st.dataframe(_totals_table(pivot, week_sessions),
                      hide_index=True, width="stretch")
 
 
-def render_month(df, color_map, mode):
+def render_month(df, color_map):
     if "month" not in st.session_state:
         st.session_state.month = today_logical().replace(day=1)
 
     c_prev, c_this, c_next, c_pick = st.columns([1, 1, 1, 4])
-    if c_prev.button("◀ Prev", width="stretch", key="mo_prev"):
+    if c_prev.button("Prev", icon=":material/chevron_left:", width="stretch", key="mo_prev"):
         prev_last = st.session_state.month - dt.timedelta(days=1)
         st.session_state.month = dd.month_bounds(prev_last)[0]
         st.rerun()
-    if c_this.button("This month", width="stretch", key="mo_this"):
+    if c_this.button("This month", icon=":material/today:", width="stretch", key="mo_this"):
         st.session_state.month = today_logical().replace(day=1)
         st.rerun()
-    if c_next.button("Next ▶", width="stretch", key="mo_next"):
+    if c_next.button("Next", icon=":material/chevron_right:", width="stretch", key="mo_next"):
         st.session_state.month = dd.month_bounds(st.session_state.month)[1] + dt.timedelta(days=1)
         st.rerun()
     picked = c_pick.date_input("Month", value=st.session_state.month,
@@ -240,15 +275,17 @@ def render_month(df, color_map, mode):
     avg_min = total_min / active_days if active_days else 0.0    # avg over active days
     busiest = daily.idxmax()
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Productive total", dd.fmt_duration(total_min * 60.0))
-    m2.metric("Avg / active day", dd.fmt_duration(avg_min * 60.0) if active_days else "—")
-    m3.metric("Active days", f"{active_days} / {daily.shape[0]}")
-    m4.metric("Busiest day", f"{busiest:%-m/%-d}", dd.fmt_duration(daily.max() * 60.0))
+    m1.metric("Productive total", dd.fmt_duration(total_min * 60.0, "minute"), border=True)
+    m2.metric("Avg / active day", dd.fmt_duration(avg_min * 60.0, "minute") if active_days else "—",
+              border=True)
+    m3.metric("Active days", f"{active_days} / {daily.shape[0]}", border=True)
+    m4.metric("Busiest day", f"{busiest:%-m/%-d}", dd.fmt_duration(daily.max() * 60.0, "minute"),
+              border=True)
 
     st.subheader("Daily activity")
     event = st.plotly_chart(
-        viz.build_stacked_daily(pivot, color_map, mode, xlabel_fmt="%-d"),
-        width="stretch", theme=None, key="month_bars",
+        viz.build_stacked_daily(pivot, color_map, xlabel_fmt="%-d"),
+        width="stretch", theme=None, key="month_bars", config=PLOTLY_CONFIG,
         on_select="rerun", selection_mode="points",
     )
     _drill_from_bar(event, "month", first, last)
@@ -278,7 +315,7 @@ def _range_bounds(df, preset):
     return start, end
 
 
-def render_heatmap(df, mode):
+def render_heatmap(df):
     activities = sorted(df["activity"].unique())
 
     c_range, c_measure = st.columns([1, 1])
@@ -304,22 +341,23 @@ def render_heatmap(df, mode):
     avg_min = total_min / active_days if active_days else 0.0
     busiest = values.idxmax() if active_days else None
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total in range", dd.fmt_duration(total_min * 60))
-    m2.metric("Avg / active day", dd.fmt_duration(avg_min * 60) if active_days else "—")
-    m3.metric("Active days", active_days)
+    m1.metric("Total in range", dd.fmt_duration(total_min * 60, "minute"), border=True)
+    m2.metric("Avg / active day", dd.fmt_duration(avg_min * 60, "minute") if active_days else "—",
+              border=True)
+    m3.metric("Active days", active_days, border=True)
     m4.metric("Busiest day", f"{busiest:%-m/%-d}" if busiest is not None else "—",
-              dd.fmt_duration(values.max() * 60) if active_days else None)
+              dd.fmt_duration(values.max() * 60, "minute") if active_days else None, border=True)
 
     # Per-day hover: date, productive total, per-activity breakdown.
     hover = {}
     for day in values.index:
         parts = [f"<b>{day:%a %-m/%-d/%Y}</b>",
-                 f"Productive: {dd.fmt_duration(float(productive.get(day, 0.0)) * 60)}"]
+                 f"Productive: {dd.fmt_duration(float(productive.get(day, 0.0)) * 60, 'minute')}"]
         breakdown = sorted(
             ((a, pivot.loc[day, a]) for a in activities if a in pivot.columns and pivot.loc[day, a] > 0),
             key=lambda kv: -kv[1],
         )
-        parts += [f"{a}: {dd.fmt_duration(v * 60)}" for a, v in breakdown]
+        parts += [f"{a}: {dd.fmt_duration(v * 60, 'minute')}" for a, v in breakdown]
         if len(parts) == 2:
             parts.append("<i>no activity</i>")
         hover[day] = "<br>".join(parts)
@@ -328,8 +366,8 @@ def render_heatmap(df, mode):
     # switch to the Day view. The Day view's own date picker is the fallback.
     grid_start, _ = viz.calendar_grid(start, end)
     event = st.plotly_chart(
-        viz.build_heatmap(values, hover, start, end, mode, unit="hr"),
-        width="stretch", theme=None, key="heatmap_select",
+        viz.build_heatmap(values, hover, start, end, unit="hr"),
+        width="stretch", theme=None, key="heatmap_select", config=PLOTLY_CONFIG,
         on_select="rerun", selection_mode="points",
     )
     points = _selected_points(event)
@@ -350,7 +388,7 @@ def render_heatmap(df, mode):
 # App shell                                                                   #
 # --------------------------------------------------------------------------- #
 def main():
-    st.title("Busy Bar — Activity Dashboard")
+    st.html(_CSS)
 
     # View is session-backed so a heatmap-cell click can switch it programmatically.
     st.session_state.setdefault("view", "Day")
@@ -361,14 +399,16 @@ def main():
         view = st.radio("View", VIEWS, index=VIEWS.index(st.session_state.view),
                         label_visibility="collapsed")
         st.session_state.view = view
-        st.header("Appearance")
-        mode = st.radio("Theme", ["light", "dark"], label_visibility="collapsed",
-                        format_func=str.capitalize)
+
         st.divider()
-        if st.button("↻ Refresh data", width="stretch"):
+        st.header("Data")
+        if st.button("Refresh", icon=":material/refresh:", width="stretch"):
             st.cache_data.clear()
             st.rerun()
-        st.caption(f"Source: `{os.path.basename(dd.DEFAULT_LOG)}`")
+        st.caption(f"Source `{os.path.basename(dd.DEFAULT_LOG)}`")
+
+    st.title("Busy Bar")
+    st.caption("A quiet look at where the time goes — heatmap down to the day.")
 
     df = get_data(dd.DEFAULT_LOG)
     if df.empty:
@@ -376,16 +416,16 @@ def main():
         return
 
     # Stable color map across every activity ever seen (so colors never shift by day).
-    color_map = theme.activity_colors(df["activity"].unique(), mode)
+    color_map = theme.activity_colors(df["activity"].unique())
 
     if view == "Day":
-        render_day(df, color_map, mode)
+        render_day(df, color_map)
     elif view == "Week":
-        render_week(df, color_map, mode)
+        render_week(df, color_map)
     elif view == "Month":
-        render_month(df, color_map, mode)
+        render_month(df, color_map)
     elif view == "Heatmap":
-        render_heatmap(df, mode)
+        render_heatmap(df)
 
 
 if __name__ == "__main__":
