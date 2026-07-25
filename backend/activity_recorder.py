@@ -43,15 +43,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 RUNNING_TYPES = ("INFINITE", "SIMPLE", "INTERVAL")
 
-DEFAULT_MAP = "activity_card_id_map.json"
-DEFAULT_OUT = "activity_log.jsonl"
-DEFAULT_ADDR = "10.0.4.20"
+# Defaults come from the environment first (so the container can point at the
+# shared /data + /config mounts) and fall back to the repo's config/ + data/ dirs
+# for a plain local run. CLI flags still override both.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # backend/ -> repo root
+DEFAULT_MAP = os.environ.get("CARD_MAP") or os.path.join(_ROOT, "config", "activity_card_id_map.json")
+DEFAULT_OUT = os.environ.get("ACTIVITY_LOG") or os.path.join(_ROOT, "data", "activity_log.jsonl")
+DEFAULT_ADDR = os.environ.get("BUSY_ADDR", "10.0.4.20")
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +466,9 @@ def main() -> int:
     p.add_argument(
         "--flow-overtime",
         action="store_true",
-        help="count work done past the timer until the break is manually started",
+        default=os.environ.get("FLOW_OVERTIME", "").lower() not in ("", "0", "false", "no"),
+        help="count work done past the timer until the break is manually started "
+             "(also enabled by FLOW_OVERTIME=1)",
     )
     p.add_argument("--raw-log", default=None, help="also append every raw snapshot to this file (debug)")
     p.add_argument("--self-test", action="store_true", help="run offline logic checks and exit")

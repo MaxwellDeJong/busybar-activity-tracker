@@ -1,0 +1,5 @@
+# Frontend (dashboard) dependencies. activity_summary.py / dashboard_data.py core
+# need only pandas; the Streamlit app adds the UI + charting layer.
+streamlit
+plotly
+pandas

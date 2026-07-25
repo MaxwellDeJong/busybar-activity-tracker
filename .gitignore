@@ -11,5 +11,10 @@ __pycache__/
 .venv/
 venv/
 
-# Recorder output: session logs and raw snapshot dumps
-*.jsonl
+# Local compose config
+.env
+
+# Recorder output: session logs and raw snapshot dumps live in the bind-mounted
+# data/ dir. Keep the dir in the tree but never commit its contents.
+data/*
+!data/.gitkeep

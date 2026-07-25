@@ -29,8 +29,12 @@ import sys
 DAY_CUTOFF_HOUR = 3           # a day runs [03:00, next 03:00) local
 MIN_DURATION_S = 60           # drop sessions shorter than this
 _HERE = os.path.dirname(os.path.abspath(__file__))
-DEFAULT_LOG = os.path.join(_HERE, "activity_log.jsonl")
-DEFAULT_CARD_MAP = os.path.join(_HERE, "activity_card_id_map.json")
+_ROOT = os.path.dirname(_HERE)   # repo root: frontend/ and data/ + config/ are siblings
+# Env first (the container points these at the shared /data + /config mounts),
+# falling back to the repo's data/ + config/ dirs for a plain local `streamlit run`.
+DEFAULT_LOG = os.environ.get("ACTIVITY_LOG") or os.path.join(_ROOT, "data", "activity_log.jsonl")
+DEFAULT_CARD_MAP = (os.environ.get("CARD_MAP")
+                    or os.path.join(_ROOT, "config", "activity_card_id_map.json"))
 
 
 # --------------------------------------------------------------------------- #

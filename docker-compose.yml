@@ -1,0 +1,31 @@
+# Busy Bar activity stack: a passive recorder that streams the device and a
+# Streamlit dashboard that visualizes the log they share.
+#
+#   ./data    - durable session log (bind-mounted into both; survives rebuilds)
+#   ./config  - card_id -> activity map (read-only; edit + restart to update both)
+#
+# Quick start:  cp .env.example .env  &&  docker compose up -d --build
+services:
+  recorder:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      BUSY_ADDR: ${BUSY_ADDR:-10.0.4.20}
+      FLOW_OVERTIME: ${FLOW_OVERTIME:-1}
+      ACTIVITY_LOG: /data/activity_log.jsonl
+      CARD_MAP: /config/activity_card_id_map.json
+    volumes:
+      - ./data:/data
+      - ./config:/config:ro
+
+  dashboard:
+    build: ./frontend
+    restart: unless-stopped
+    ports:
+      - "${DASHBOARD_PORT:-8501}:8501"
+    environment:
+      ACTIVITY_LOG: /data/activity_log.jsonl
+      CARD_MAP: /config/activity_card_id_map.json
+    volumes:
+      - ./data:/data
+      - ./config:/config:ro
