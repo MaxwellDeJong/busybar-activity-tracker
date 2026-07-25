@@ -1,0 +1,3 @@
+# Backend (recorder) dependencies. busylib pulls in the device WS client and the
+# protobuf codec that busy_probe uses to decode timer snapshots.
+busylib
