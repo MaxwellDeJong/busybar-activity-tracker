@@ -10,6 +10,7 @@ services:
     build: ./backend
     restart: unless-stopped
     environment:
+      TZ: ${TZ:-America/New_York}
       BUSY_ADDR: ${BUSY_ADDR:-10.0.4.20}
       FLOW_OVERTIME: ${FLOW_OVERTIME:-1}
       ACTIVITY_LOG: /data/activity_log.jsonl
@@ -24,6 +25,7 @@ services:
     ports:
       - "${DASHBOARD_PORT:-8501}:8501"
     environment:
+      TZ: ${TZ:-America/New_York}
       ACTIVITY_LOG: /data/activity_log.jsonl
       CARD_MAP: /config/activity_card_id_map.json
     volumes:
