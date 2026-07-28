@@ -20,6 +20,17 @@ given activity and phase. It ends when the timer stops running (pause, abandon,
 completion) or the activity/phase changes. The end timestamp is the moment the
 timer stopped running (Request 1).
 
+Restart durability (--state)
+----------------------------
+The open session lives in memory, but the bar publishes a snapshot only when the
+timer *changes* state — so a recorder restart mid-session used to lose it
+outright: the tracker came back empty, and the eventual stop closed nothing.
+The tracker therefore mirrors its state to a small JSON file on every
+transition, and on startup either resumes the open session or closes it as
+`truncated`, depending on how long we were down (--resume-max-gap). Downtime is
+measured from the file's `saved_at`, which the SIGTERM/SIGINT hook refreshes on
+the way out, so an orderly restart resumes and an unobserved outage does not.
+
 Flow overtime (--flow-overtime)
 -------------------------------
 With interval autostart disabled (all shipped activities), when work time
@@ -44,11 +55,23 @@ import argparse
 import asyncio
 import json
 import os
+import signal
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 RUNNING_TYPES = ("INFINITE", "SIMPLE", "INTERVAL")
+
+# Bump when the persisted state's shape changes; an older file is then ignored
+# rather than misread (a lost resume costs one session, a misread corrupts one).
+STATE_VERSION = 1
+
+# How long the recorder may be down and still resume the session it had open.
+# Generous enough for a rebuild or a host reboot, short enough that a real
+# outage — where the stop we never saw could be anywhere in the gap — falls back
+# to a truncated record instead of a session stretched across it.
+DEFAULT_RESUME_MAX_GAP_S = 900.0
 
 # Defaults come from the environment first (so the container can point at the
 # shared /data + /config mounts) and fall back to the repo's config/ + data/ dirs
@@ -56,6 +79,7 @@ RUNNING_TYPES = ("INFINITE", "SIMPLE", "INTERVAL")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # backend/ -> repo root
 DEFAULT_MAP = os.environ.get("CARD_MAP") or os.path.join(_ROOT, "config", "activity_card_id_map.json")
 DEFAULT_OUT = os.environ.get("ACTIVITY_LOG") or os.path.join(_ROOT, "data", "activity_log.jsonl")
+DEFAULT_STATE = os.environ.get("RECORDER_STATE") or os.path.join(_ROOT, "data", "recorder_state.json")
 DEFAULT_ADDR = os.environ.get("BUSY_ADDR", "10.0.4.20")
 
 
@@ -115,6 +139,22 @@ class SessionTracker:
         self.open: dict | None = None
         self.overtime_start_ms: int | None = None
         self._observed_stop = False  # have we ever seen a non-running snapshot?
+
+    # -- persistence ------------------------------------------------------
+    # Only the fields that cannot be re-derived from the next snapshot: the open
+    # session, its overtime clock, and whether we have ever seen a stop (which
+    # decides `partial` for the *next* session opened).
+    def to_state(self) -> dict:
+        return {
+            "open": self.open,
+            "overtime_start_ms": self.overtime_start_ms,
+            "observed_stop": self._observed_stop,
+        }
+
+    def load_state(self, st: dict) -> None:
+        self.open = st.get("open") or None
+        self.overtime_start_ms = st.get("overtime_start_ms")
+        self._observed_stop = bool(st.get("observed_stop", False))
 
     def _open(self, st: dict, ts_ms: int) -> None:
         self.open = {
@@ -226,6 +266,85 @@ class SessionWriter:
 
 
 # ---------------------------------------------------------------------------
+# Persisted tracker state
+# ---------------------------------------------------------------------------
+class StateStore:
+    """Mirror of the tracker's in-memory session state, so a restart mid-session
+    doesn't lose it (see §Restart durability).
+
+    Written on every *transition* rather than every snapshot: between two
+    transitions nothing about the open session changes, so the only field that
+    goes stale is ``last_ts_ms``. That is only a replay guard, and the snapshots
+    it would let through a second time are by definition the ones that changed
+    nothing. This keeps the WebSocket path — which streams continuously — from
+    rewriting the file several times a second.
+    """
+
+    def __init__(self, path: Path | None):
+        self.path = path
+        self._written: str | None = None  # last session payload written, serialized
+
+    def load(self) -> dict | None:
+        """Return the persisted payload, or None if absent/unusable. A corrupt or
+        stale-format file costs one session's resume; it must never be fatal."""
+        if self.path is None:
+            return None
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (ValueError, OSError) as exc:
+            print(f"  warning: ignoring unreadable state file {self.path} ({exc})")
+            return None
+        if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+            print(f"  warning: ignoring state file {self.path} (version mismatch)")
+            return None
+        return data
+
+    def save(self, tracker: SessionTracker, last_ts_ms: int, force: bool = False) -> bool:
+        """Persist the tracker's state. Returns True if the file was written.
+
+        `force` refreshes `saved_at` even when nothing changed — used by the
+        shutdown hook, where the point of the write is to timestamp our exit.
+        """
+        if self.path is None:
+            return False
+        session = tracker.to_state()
+        serialized = json.dumps(session, sort_keys=True)
+        if not force and serialized == self._written:
+            return False
+        payload = dict(session, version=STATE_VERSION, last_ts_ms=last_ts_ms, saved_at=time.time())
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(self.path.suffix + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        tmp.replace(self.path)  # atomic swap so a crash mid-write can't corrupt it
+        self._written = serialized
+        return True
+
+
+def plan_resume(persisted: dict | None, now: float, max_gap_s: float) -> tuple[bool, str]:
+    """Decide whether a persisted open session may be picked back up.
+
+    Downtime is `now - saved_at`, both host clock. The shutdown hook refreshes
+    `saved_at` on the way out, so after an orderly restart this is the real
+    downtime; after a crash it dates back to the last transition and reads as a
+    long gap — which biases exactly the right way, since a crash is also when we
+    are least sure what the bar did while we were blind.
+    """
+    if not persisted or not persisted.get("open"):
+        return False, "no session was open"
+    saved_at = persisted.get("saved_at")
+    if not isinstance(saved_at, (int, float)):
+        return False, "state file has no save time"
+    gap = now - float(saved_at)
+    if gap > max_gap_s:
+        return False, f"recorder was down {gap / 60:.0f}m (limit {max_gap_s / 60:.0f}m)"
+    if gap < 0:
+        return False, "state file is from the future (clock moved backwards)"
+    return True, f"down {gap:.0f}s"
+
+
+# ---------------------------------------------------------------------------
 # Live streaming loop
 # ---------------------------------------------------------------------------
 def load_map(path: Path) -> dict:
@@ -241,6 +360,7 @@ def process_parsed(
     tracker: SessionTracker,
     writer: SessionWriter,
     raw_log: Path | None,
+    store: "StateStore | None" = None,
 ) -> None:
     """Feed one decoded snapshot payload through the tracker.
 
@@ -264,6 +384,10 @@ def process_parsed(
             f.write(json.dumps(parsed, separators=(",", ":")) + "\n")
     for record in tracker.on_snapshot(snap, ts_ms):
         writer.write(record)
+    # Log first, then persist: a crash in between costs a resume, whereas the
+    # reverse order could resurrect a session already written and double-count it.
+    if store is not None:
+        store.save(tracker, ts_ms)
 
 
 async def run_stream(
@@ -272,13 +396,15 @@ async def run_stream(
     tracker: SessionTracker,
     writer: SessionWriter,
     raw_log: Path | None,
+    state: dict,
+    store: StateStore | None = None,
 ) -> None:
     # Reuse the proven client + protobuf-json decode from the discovery probe.
     from busy_probe import make_client, _decode_json_wrapper, TIMER_KEY
 
     backoff = 1
-    # Persists across reconnects (see process_parsed for the dedupe rationale).
-    state = {"last_ts_ms": -1}
+    # `state` carries last_ts_ms across reconnects *and* across restarts when it
+    # was seeded from the state file (see process_parsed for the dedupe rationale).
     while True:
         bb = make_client(async_=True, addr=addr, token=token)
         try:
@@ -291,7 +417,7 @@ async def run_stream(
                     if not isinstance(update, dict) or TIMER_KEY not in update:
                         continue
                     parsed, _note = _decode_json_wrapper(update[TIMER_KEY])
-                    process_parsed(parsed, state, tracker, writer, raw_log)
+                    process_parsed(parsed, state, tracker, writer, raw_log, store)
         except (KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — keep the recorder alive across drops
@@ -299,6 +425,8 @@ async def run_stream(
             # we actually saw, rather than letting it run across the outage.
             for record in tracker.close_open(state["last_ts_ms"]):
                 writer.write(record)
+            if store is not None:
+                store.save(tracker, state["last_ts_ms"])
             print(f"  stream error ({type(exc).__name__}: {exc}); reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30)
@@ -316,7 +444,9 @@ def run_mqtt(
     tracker: SessionTracker,
     writer: SessionWriter,
     raw_log: Path | None,
+    state: dict,
     client_id: str,
+    store: StateStore | None = None,
     tls: bool = False,
     tls_insecure: bool = False,
     ca_certs: str | None = None,
@@ -333,9 +463,6 @@ def run_mqtt(
     """
     import paho.mqtt.client as mqtt
 
-    # Persists across reconnects within this process (see process_parsed).
-    state = {"last_ts_ms": -1}
-
     def on_connect(client, userdata, flags, reason_code, properties=None):
         if reason_code.is_failure:
             print(f"  mqtt connect failed: {reason_code}")
@@ -349,6 +476,8 @@ def run_mqtt(
         # durable session most drops lose nothing, so `truncated` records are rare.
         for record in tracker.close_open(state["last_ts_ms"]):
             writer.write(record)
+        if store is not None:
+            store.save(tracker, state["last_ts_ms"])
         print(f"  mqtt disconnected (rc={reason_code}); paho will auto-reconnect")
 
     def on_message(client, userdata, msg):
@@ -356,7 +485,7 @@ def run_mqtt(
             parsed = json.loads(msg.payload.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             return
-        process_parsed(parsed, state, tracker, writer, raw_log)
+        process_parsed(parsed, state, tracker, writer, raw_log, store)
 
     # Durable session so the broker buffers QoS-1 messages across recorder restarts.
     client = mqtt.Client(
@@ -544,6 +673,86 @@ def self_test() -> int:
     )
     check("normal close is not truncated", [r["truncated"] for r in res], [False])
 
+    # 11. Restart durability: a session open across a restart survives, and the
+    # record it eventually produces has the *original* start, not the restart.
+    tr = SessionTracker({"ID2": "tech_reading"}, flow_overtime=False)
+    tr.on_snapshot(_snap("NOT_STARTED"), 0)
+    tr.on_snapshot(_snap("INTERVAL", index=0), 10 * S)  # running when we go down
+    saved = tr.to_state()
+    revived = SessionTracker({"ID2": "tech_reading"}, flow_overtime=False)
+    revived.load_state(json.loads(json.dumps(saved)))  # via the file's JSON round trip
+    res = revived.on_snapshot(_snap("INTERVAL", index=0, paused=True), 130 * S)
+    check(
+        "restart mid-session → resumed session keeps its original start",
+        [(r["phase"], r["duration_s"], r["truncated"], r["partial"]) for r in res],
+        [("work", 120.0, False, False)],
+    )
+
+    # Without a resume the same restart loses the session entirely: the tracker
+    # comes back empty and the stop has nothing to close. This is the bug.
+    naive = SessionTracker({"ID2": "tech_reading"}, flow_overtime=False)
+    check("restart without resume → stop closes nothing",
+          naive.on_snapshot(_snap("INTERVAL", index=0, paused=True), 130 * S), [])
+
+    # observed_stop survives too, so the next session isn't wrongly marked partial.
+    revived = SessionTracker({"ID2": "tech_reading"}, flow_overtime=False)
+    revived.load_state(saved)
+    revived.on_snapshot(_snap("INTERVAL", index=0, paused=True), 130 * S)
+    res = revived.on_snapshot(_snap("INTERVAL", index=0), 140 * S)
+    res = revived.on_snapshot(_snap("NOT_STARTED"), 200 * S)
+    check("resumed tracker remembers it has observed a stop", [r["partial"] for r in res], [False])
+
+    # Overtime clock survives a restart (flow mode).
+    tr = SessionTracker({"ID2": "tech_reading"}, flow_overtime=True)
+    tr.on_snapshot(_snap("NOT_STARTED"), 0)
+    tr.on_snapshot(_snap("INTERVAL", index=0), 10 * S)
+    tr.on_snapshot(_snap("INTERVAL", index=1, paused=True, left=0), 1500 * S)  # into overtime
+    revived = SessionTracker({"ID2": "tech_reading"}, flow_overtime=True)
+    revived.load_state(json.loads(json.dumps(tr.to_state())))
+    res = revived.on_snapshot(_snap("INTERVAL", index=1), 1700 * S)  # break started
+    check("overtime clock survives a restart",
+          [(r["duration_s"], r.get("overtime_s")) for r in res], [(1690.0, 200.0)])
+
+    # 12. plan_resume weighs downtime, not session length.
+    fresh = {"open": {"key": "x"}, "saved_at": 1000.0}
+    check("plan_resume: brief restart resumes", plan_resume(fresh, 1030.0, 900.0)[0], True)
+    check("plan_resume: long outage does not resume", plan_resume(fresh, 5000.0, 900.0)[0], False)
+    check("plan_resume: nothing open → nothing to resume",
+          plan_resume({"open": None, "saved_at": 1000.0}, 1001.0, 900.0)[0], False)
+    check("plan_resume: missing state → nothing to resume", plan_resume(None, 1.0, 900.0)[0], False)
+    check("plan_resume: clock moved backwards → do not resume",
+          plan_resume(fresh, 900.0, 900.0)[0], False)
+
+    # 13. StateStore round trip: writes on change, skips a no-op, reloads.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        path = Path(td) / "recorder_state.json"
+        store = StateStore(path)
+        tr = SessionTracker({"ID2": "tech_reading"}, flow_overtime=False)
+        tr.on_snapshot(_snap("NOT_STARTED"), 0)
+        tr.on_snapshot(_snap("INTERVAL", index=0), 10 * S)
+        check("StateStore writes on a transition", store.save(tr, 10 * S), True)
+        check("StateStore skips an unchanged save", store.save(tr, 20 * S), False)
+        check("StateStore forces a write for the shutdown stamp", store.save(tr, 20 * S, True), True)
+
+        loaded = store.load()
+        revived = SessionTracker({"ID2": "tech_reading"}, flow_overtime=False)
+        revived.load_state(loaded)
+        check("StateStore reload restores the open session",
+              revived.open == tr.open and revived.to_state() == tr.to_state(), True)
+        check("persisted last_ts_ms survives", loaded["last_ts_ms"], 20 * S)
+
+        tr.on_snapshot(_snap("NOT_STARTED"), 130 * S)  # session closed
+        check("StateStore writes again once the session closes", store.save(tr, 130 * S), True)
+        check("closed session is not resurrected", store.load()["open"], None)
+
+        path.write_text('{"version": 999, "open": {}}', encoding="utf-8")
+        check("StateStore ignores a future version", StateStore(path).load(), None)
+        path.write_text("{not json", encoding="utf-8")
+        check("StateStore ignores a corrupt file", StateStore(path).load(), None)
+        check("StateStore disabled by empty path", StateStore(None).load(), None)
+
     print("\nself-test:", "ALL PASS" if ok else "FAILURES")
     return 0 if ok else 1
 
@@ -551,6 +760,24 @@ def self_test() -> int:
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def _install_shutdown_hook(save) -> None:
+    """Persist on SIGTERM/SIGINT, then hand over to the normal exit path.
+
+    Without this the state file's `saved_at` would date from the last session
+    transition, and plan_resume would read an orderly restart during a long
+    session as a long outage and refuse to resume it.
+    """
+    def handler(signum, frame):  # noqa: ARG001 — signal handler signature
+        save()
+        raise KeyboardInterrupt
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, handler)
+        except (ValueError, OSError):  # not the main thread / unsupported platform
+            pass
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--addr", default=DEFAULT_ADDR, help=f"device address (default {DEFAULT_ADDR})")
@@ -565,6 +792,15 @@ def main() -> int:
              "(also enabled by FLOW_OVERTIME=1)",
     )
     p.add_argument("--raw-log", default=None, help="also append every raw snapshot to this file (debug)")
+    p.add_argument("--state", default=DEFAULT_STATE,
+                   help=f"persisted open-session state, so a restart mid-session resumes "
+                        f"instead of losing it (also RECORDER_STATE; default {DEFAULT_STATE}). "
+                        f"Empty string disables persistence.")
+    p.add_argument("--resume-max-gap", type=float,
+                   default=float(os.environ.get("RESUME_MAX_GAP_S") or DEFAULT_RESUME_MAX_GAP_S),
+                   help="seconds of downtime after which a persisted session is closed as "
+                        "truncated rather than resumed (also RESUME_MAX_GAP_S; "
+                        f"default {DEFAULT_RESUME_MAX_GAP_S:.0f})")
     p.add_argument("--self-test", action="store_true", help="run offline logic checks and exit")
 
     # MQTT transport (durable, buffered). When --mqtt / MQTT_BROKER is set the
@@ -620,6 +856,35 @@ def main() -> int:
     writer = SessionWriter(Path(args.out))
     raw_log = Path(args.raw_log) if args.raw_log else None
 
+    # Restore whatever was open when we last went down. `state` carries
+    # last_ts_ms into the transports so a replayed snapshot we already processed
+    # before the restart can't re-close the session we are resuming.
+    store = StateStore(Path(args.state) if args.state else None)
+    state = {"last_ts_ms": -1}
+    persisted = store.load()
+    if persisted:
+        tracker.load_state(persisted)
+        state["last_ts_ms"] = int(persisted.get("last_ts_ms", -1))
+        resume, why = plan_resume(persisted, time.time(), args.resume_max_gap)
+        if tracker.open is None:
+            print(f"resumed state from {args.state} (no session was open)")
+        elif resume:
+            print(f"resuming open {tracker.open['phase']} session for "
+                  f"{tracker.open['key']} started {_iso(tracker.open['start_ms'])} ({why})")
+        else:
+            # We cannot know when the timer actually stopped, so close at the last
+            # snapshot we saw. `truncated` marks the end as a lower bound.
+            print(f"not resuming open session for {tracker.open['key']}: {why}")
+            for record in tracker.close_open(state["last_ts_ms"]):
+                writer.write(record)
+        store.save(tracker, state["last_ts_ms"], force=True)
+    elif store.path is not None:
+        print(f"session state: {args.state} (no prior state)")
+
+    # SIGTERM is how `docker compose stop/restart` ends us; stamping the state
+    # file on the way out is what lets plan_resume measure real downtime.
+    _install_shutdown_hook(lambda: store.save(tracker, state["last_ts_ms"], force=True))
+
     try:
         if args.mqtt:
             host, _, port = args.mqtt.partition(":")
@@ -627,18 +892,19 @@ def main() -> int:
             print(f"transport: MQTT ({'mqtts' if use_tls else 'mqtt'}://{host}:{port or 1883})")
             run_mqtt(
                 host, int(port or 1883), args.mqtt_topic,
-                tracker, writer, raw_log, args.mqtt_client_id,
+                tracker, writer, raw_log, state, args.mqtt_client_id, store,
                 tls=use_tls, tls_insecure=args.mqtt_tls_insecure, ca_certs=args.mqtt_ca,
                 username=args.mqtt_username, password=args.mqtt_password,
             )
         else:
             print(f"transport: WebSocket ({args.addr})")
-            asyncio.run(run_stream(args.addr, args.token, tracker, writer, raw_log))
+            asyncio.run(run_stream(args.addr, args.token, tracker, writer, raw_log, state, store))
     except KeyboardInterrupt:
         print("\nstopped.")
         if tracker.open is not None:
             print(f"note: an in-progress {tracker.open['phase']} session for "
-                  f"{tracker.open['key']} was not closed (still running at exit).")
+                  f"{tracker.open['key']} was not closed; it is held in {args.state} "
+                  f"and resumes if we are back within {args.resume_max_gap:.0f}s.")
     return 0
 
 

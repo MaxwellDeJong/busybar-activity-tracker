@@ -61,6 +61,13 @@ services:
       BUSY_ADDR: ${BUSY_ADDR:-10.0.4.20}
       FLOW_OVERTIME: ${FLOW_OVERTIME:-1}
       ACTIVITY_LOG: /data/activity_log.jsonl
+      # The bar publishes only when the timer *changes*, so a restart mid-session
+      # would otherwise lose it: the tracker would come back empty and the stop
+      # would close nothing. This mirrors the open session to disk; on start it
+      # resumes if we were down less than RESUME_MAX_GAP_S, else closes it as
+      # truncated (end = last snapshot seen, a lower bound).
+      RECORDER_STATE: ${RECORDER_STATE:-/data/recorder_state.json}
+      RESUME_MAX_GAP_S: ${RESUME_MAX_GAP_S:-900}
       CARD_MAP: /config/activity_card_id_map.json
     volumes:
       - ./data:/data
