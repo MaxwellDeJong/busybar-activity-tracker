@@ -1,16 +1,63 @@
-# Busy Bar activity stack: a passive recorder that streams the device and a
-# Streamlit dashboard that visualizes the log they share.
+# Busy Bar activity stack: an MQTT broker the bar publishes to, a linker that
+# completes the device's account link (so it starts publishing snapshots), a
+# passive recorder that subscribes, and a Streamlit dashboard over the log.
 #
-#   ./data    - durable session log (bind-mounted into both; survives rebuilds)
+#   ./data    - durable session log + linker state (bind-mounted; survives rebuilds)
 #   ./config  - card_id -> activity map (read-only; edit + restart to update both)
+#   ./broker  - mosquitto.conf for the MQTT broker
+#
+# The bar reaches the broker at the HOST's LAN IP on ${MQTT_PORT} (published
+# below); the recorder + linker reach it in-network at mosquitto:1883. Point the
+# device at the broker once from the USB-tethered laptop (USB-only HTTP API; use
+# PUT and client_cert_type:"none" — see docs/mqtt-migration.md §6.4):
+#   curl -X PUT http://<bar-usb-ip>/api/account/backend \
+#     -d '{"server_url":"mqtt://<homelab-ip>:1883","client_cert_type":"none","ignore_server_cert":true}'
+# The linker then flips the device to linked automatically on its next presence.
 #
 # Quick start:  cp .env.example .env  &&  docker compose up -d --build
 services:
+  mosquitto:
+    image: eclipse-mosquitto:2
+    restart: unless-stopped
+    ports:
+      - "${MQTT_PORT:-1883}:1883"
+    volumes:
+      - ./broker/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+      - mosquitto-data:/mosquitto/data
+
+  linker:
+    # Reuses the backend image (already has paho-mqtt); just a different entrypoint.
+    build: ./backend
+    restart: unless-stopped
+    depends_on:
+      - mosquitto
+    environment:
+      TZ: ${TZ:-America/New_York}
+      MQTT_BROKER: ${MQTT_BROKER:-mosquitto:1883}
+      # Persisted per-serial token timestamps — survives restarts so a just-linked
+      # bar isn't needlessly re-tokened. It's a cooldown, not a permanent set, so
+      # the linker self-heals if a bar resets its link state on reboot.
+      LINKER_STATE: ${LINKER_STATE:-/data/linker_state.json}
+      LINKER_COOLDOWN_S: ${LINKER_COOLDOWN_S:-60}
+      # Cosmetic "linked account" the device stores and shows in its UI.
+      LINK_EMAIL: ${LINK_EMAIL:-homelab@local}
+      LINK_USER_ID: ${LINK_USER_ID:-homelab}
+    volumes:
+      - ./data:/data
+    command: ["python", "mqtt_linker.py"]
+
   recorder:
     build: ./backend
     restart: unless-stopped
+    depends_on:
+      - mosquitto
     environment:
       TZ: ${TZ:-America/New_York}
+      # MQTT transport (durable, buffered). The recorder subscribes here; unset
+      # MQTT_BROKER to fall back to the WebSocket at BUSY_ADDR instead.
+      MQTT_BROKER: ${MQTT_BROKER:-mosquitto:1883}
+      MQTT_TOPIC: ${MQTT_TOPIC:-sessions/+/up/v1/busy/snapshot}
+      MQTT_CLIENT_ID: ${MQTT_CLIENT_ID:-busybar-recorder}
       BUSY_ADDR: ${BUSY_ADDR:-10.0.4.20}
       FLOW_OVERTIME: ${FLOW_OVERTIME:-1}
       ACTIVITY_LOG: /data/activity_log.jsonl
@@ -31,3 +78,6 @@ services:
     volumes:
       - ./data:/data
       - ./config:/config:ro
+
+volumes:
+  mosquitto-data:

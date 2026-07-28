@@ -1,3 +1,7 @@
 # Backend (recorder) dependencies. busylib pulls in the device WS client and the
-# protobuf codec that busy_probe uses to decode timer snapshots.
+# protobuf codec that busy_probe uses to decode timer snapshots (WS transport).
 busylib
+
+# paho-mqtt drives the MQTT transport (the durable, broker-buffered path). 2.1+
+# for the VERSION2 callback API used in activity_recorder.run_mqtt.
+paho-mqtt>=2.1

@@ -59,6 +59,11 @@ DEFAULT_OUT = os.environ.get("ACTIVITY_LOG") or os.path.join(_ROOT, "data", "act
 DEFAULT_ADDR = os.environ.get("BUSY_ADDR", "10.0.4.20")
 
 
+def _env_flag(name: str) -> bool:
+    """Interpret an env var as a boolean flag (unset/0/false/no → False)."""
+    return os.environ.get(name, "").strip().lower() not in ("", "0", "false", "no")
+
+
 # ---------------------------------------------------------------------------
 # Snapshot → (running, key, phase, index) derivation
 # ---------------------------------------------------------------------------
@@ -230,6 +235,37 @@ def load_map(path: Path) -> dict:
     return data
 
 
+def process_parsed(
+    parsed: dict,
+    state: dict,
+    tracker: SessionTracker,
+    writer: SessionWriter,
+    raw_log: Path | None,
+) -> None:
+    """Feed one decoded snapshot payload through the tracker.
+
+    Shared by both transports. `parsed` is the top-level object
+    ``{"snapshot": {...}, "snapshot_timestamp_ms": <ms>}`` — the WS yields it
+    after protobuf-JSON decode, MQTT after ``json.loads``. `state` is a mutable
+    dict carrying ``last_ts_ms`` across reconnects within the process: both
+    transports can replay/redeliver the last snapshot (WS replays on connect,
+    MQTT QoS-1 can redeliver), so we drop anything not strictly newer. This
+    keeps a stale replay from spuriously closing a live session.
+    """
+    if not isinstance(parsed, dict):
+        return
+    snap = parsed.get("snapshot", parsed)
+    ts_ms = int(parsed.get("snapshot_timestamp_ms", 0))
+    if ts_ms <= state["last_ts_ms"]:
+        return  # stale/duplicate replay or redelivery — ignore
+    state["last_ts_ms"] = ts_ms
+    if raw_log is not None:
+        with raw_log.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(parsed, separators=(",", ":")) + "\n")
+    for record in tracker.on_snapshot(snap, ts_ms):
+        writer.write(record)
+
+
 async def run_stream(
     addr: str,
     token: str | None,
@@ -241,10 +277,8 @@ async def run_stream(
     from busy_probe import make_client, _decode_json_wrapper, TIMER_KEY
 
     backoff = 1
-    # Persists across reconnects: the stream replays the last (possibly stale)
-    # snapshot on connect, so we drop any snapshot not newer than the last we
-    # acted on. This keeps a stale replay from spuriously closing a live session.
-    last_ts_ms = -1
+    # Persists across reconnects (see process_parsed for the dedupe rationale).
+    state = {"last_ts_ms": -1}
     while True:
         bb = make_client(async_=True, addr=addr, token=token)
         try:
@@ -257,24 +291,13 @@ async def run_stream(
                     if not isinstance(update, dict) or TIMER_KEY not in update:
                         continue
                     parsed, _note = _decode_json_wrapper(update[TIMER_KEY])
-                    if not isinstance(parsed, dict):
-                        continue
-                    snap = parsed.get("snapshot", parsed)
-                    ts_ms = int(parsed.get("snapshot_timestamp_ms", 0))
-                    if ts_ms <= last_ts_ms:
-                        continue  # stale/duplicate replay — ignore
-                    last_ts_ms = ts_ms
-                    if raw_log is not None:
-                        with raw_log.open("a", encoding="utf-8") as f:
-                            f.write(json.dumps(parsed, separators=(",", ":")) + "\n")
-                    for record in tracker.on_snapshot(snap, ts_ms):
-                        writer.write(record)
+                    process_parsed(parsed, state, tracker, writer, raw_log)
         except (KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — keep the recorder alive across drops
             # Bound the damage: close any in-progress session at the last snapshot
             # we actually saw, rather than letting it run across the outage.
-            for record in tracker.close_open(last_ts_ms):
+            for record in tracker.close_open(state["last_ts_ms"]):
                 writer.write(record)
             print(f"  stream error ({type(exc).__name__}: {exc}); reconnecting in {backoff}s")
             await asyncio.sleep(backoff)
@@ -284,6 +307,77 @@ async def run_stream(
                 await bb.close()
             except Exception:  # noqa: BLE001
                 pass
+
+
+def run_mqtt(
+    broker: str,
+    port: int,
+    topic: str,
+    tracker: SessionTracker,
+    writer: SessionWriter,
+    raw_log: Path | None,
+    client_id: str,
+    tls: bool = False,
+    tls_insecure: bool = False,
+    ca_certs: str | None = None,
+    username: str | None = None,
+    password: str | None = None,
+) -> None:
+    """Record from an MQTT broker the bar publishes snapshots to.
+
+    Unlike the live-only WebSocket, the broker buffers QoS-1 messages for a
+    durable session (fixed client_id, clean_session=False) while the recorder is
+    briefly offline, so restarts/crashes don't lose events. paho's threaded loop
+    delivers each snapshot to on_message; the tracker/writer are synchronous, so
+    no asyncio is needed here.
+    """
+    import paho.mqtt.client as mqtt
+
+    # Persists across reconnects within this process (see process_parsed).
+    state = {"last_ts_ms": -1}
+
+    def on_connect(client, userdata, flags, reason_code, properties=None):
+        if reason_code.is_failure:
+            print(f"  mqtt connect failed: {reason_code}")
+            return
+        print(f"connected to mqtt://{broker}:{port}; subscribing {topic!r} (qos 1)")
+        client.subscribe(topic, qos=1)
+
+    def on_disconnect(client, userdata, flags=None, reason_code=None, properties=None):
+        # Bound the damage exactly like the WS path: close any open session at the
+        # last snapshot we actually saw rather than across the outage. With a
+        # durable session most drops lose nothing, so `truncated` records are rare.
+        for record in tracker.close_open(state["last_ts_ms"]):
+            writer.write(record)
+        print(f"  mqtt disconnected (rc={reason_code}); paho will auto-reconnect")
+
+    def on_message(client, userdata, msg):
+        try:
+            parsed = json.loads(msg.payload.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            return
+        process_parsed(parsed, state, tracker, writer, raw_log)
+
+    # Durable session so the broker buffers QoS-1 messages across recorder restarts.
+    client = mqtt.Client(
+        mqtt.CallbackAPIVersion.VERSION2,
+        client_id=client_id,
+        clean_session=False,
+    )
+    client.on_connect = on_connect
+    client.on_disconnect = on_disconnect
+    client.on_message = on_message
+    if username:
+        client.username_pw_set(username, password)
+    if tls:
+        # §3.1 fallback: the device's MQTT stack may insist on TLS. A self-signed
+        # broker cert works with tls_insecure (skip hostname/CA verification).
+        client.tls_set(ca_certs=ca_certs)
+        if tls_insecure:
+            client.tls_insecure_set(True)
+    client.reconnect_delay_set(min_delay=1, max_delay=30)
+    client.connect(broker, port, keepalive=60)
+    client.loop_forever(retry_first_connection=True)
 
 
 # ---------------------------------------------------------------------------
@@ -472,6 +566,35 @@ def main() -> int:
     )
     p.add_argument("--raw-log", default=None, help="also append every raw snapshot to this file (debug)")
     p.add_argument("--self-test", action="store_true", help="run offline logic checks and exit")
+
+    # MQTT transport (durable, buffered). When --mqtt / MQTT_BROKER is set the
+    # recorder subscribes to the broker instead of opening the device WebSocket.
+    p.add_argument(
+        "--mqtt",
+        metavar="HOST[:PORT]",
+        default=os.environ.get("MQTT_BROKER"),
+        help="record from an MQTT broker instead of the WebSocket "
+             "(also set by MQTT_BROKER; default port 1883)",
+    )
+    p.add_argument("--mqtt-topic",
+                   default=os.environ.get("MQTT_TOPIC", "sessions/+/up/v1/busy/snapshot"),
+                   help="snapshot topic to subscribe to. The firmware publishes snapshots on "
+                        "the session scope once linked, so the default matches any session "
+                        "(default sessions/+/up/v1/busy/snapshot)")
+    p.add_argument("--mqtt-client-id", default=os.environ.get("MQTT_CLIENT_ID", "busybar-recorder"),
+                   help="durable client id; keep stable so the broker buffers across restarts")
+    p.add_argument("--mqtt-tls", action="store_true",
+                   default=_env_flag("MQTT_TLS"),
+                   help="connect over TLS (mqtts); use if the device refuses plain mqtt")
+    p.add_argument("--mqtt-tls-insecure", action="store_true",
+                   default=_env_flag("MQTT_TLS_INSECURE"),
+                   help="skip broker cert/hostname verification (self-signed broker cert)")
+    p.add_argument("--mqtt-ca", default=os.environ.get("MQTT_CA"),
+                   help="path to a CA cert bundle to verify the broker (implies TLS)")
+    p.add_argument("--mqtt-username", default=os.environ.get("MQTT_USERNAME"),
+                   help="broker username (if the broker requires auth)")
+    p.add_argument("--mqtt-password", default=os.environ.get("MQTT_PASSWORD"),
+                   help="broker password")
     args = p.parse_args()
 
     # Line-buffer stdout so a long-running foreground recorder shows progress
@@ -498,7 +621,19 @@ def main() -> int:
     raw_log = Path(args.raw_log) if args.raw_log else None
 
     try:
-        asyncio.run(run_stream(args.addr, args.token, tracker, writer, raw_log))
+        if args.mqtt:
+            host, _, port = args.mqtt.partition(":")
+            use_tls = args.mqtt_tls or bool(args.mqtt_ca)
+            print(f"transport: MQTT ({'mqtts' if use_tls else 'mqtt'}://{host}:{port or 1883})")
+            run_mqtt(
+                host, int(port or 1883), args.mqtt_topic,
+                tracker, writer, raw_log, args.mqtt_client_id,
+                tls=use_tls, tls_insecure=args.mqtt_tls_insecure, ca_certs=args.mqtt_ca,
+                username=args.mqtt_username, password=args.mqtt_password,
+            )
+        else:
+            print(f"transport: WebSocket ({args.addr})")
+            asyncio.run(run_stream(args.addr, args.token, tracker, writer, raw_log))
     except KeyboardInterrupt:
         print("\nstopped.")
         if tracker.open is not None:
