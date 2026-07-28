@@ -27,6 +27,7 @@ RUN python activity_recorder.py --self-test \
 # Paths default to the shared mounts; BUSY_ADDR / FLOW_OVERTIME come from compose.
 ENV TZ=America/New_York \
     ACTIVITY_LOG=/data/activity_log.jsonl \
+    RECORDER_STATE=/data/recorder_state.json \
     CARD_MAP=/config/activity_card_id_map.json
 
 CMD ["python", "activity_recorder.py"]

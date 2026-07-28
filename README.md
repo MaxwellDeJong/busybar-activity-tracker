@@ -54,7 +54,8 @@ frontend/    dashboard — reads the log, renders the interactive views
   dashboard_theme.py     palette + Plotly theming
   activity_summary.py    single-day CLI summary
 config/      activity_card_id_map.json — the one coordination point with firmware
-data/        activity_log.jsonl + linker_state.json (gitignored, bind-mounted)
+data/        activity_log.jsonl + recorder_state.json + linker_state.json
+             (gitignored, bind-mounted)
 docs/        design + migration notes
 ```
 
@@ -225,6 +226,34 @@ Each line of `data/activity_log.jsonl`:
 
 The log is **append-only**: the recorder only ever opens it `"a"`, and nothing in
 the stack rewrites or deletes a line. Treat it that way by hand too.
+
+### Sessions that outlive a restart
+
+The bar publishes a snapshot only when the timer *changes* state — it is silent
+for a session that is simply running. The open session therefore cannot be
+re-derived after a restart, and before `RECORDER_STATE` existed a restart
+mid-session lost it outright: the tracker came back empty and the eventual stop
+had nothing to close, so no record was written at all.
+
+The recorder now mirrors the open session to `data/recorder_state.json` on every
+transition, and stamps it again on SIGTERM (how `docker compose stop/restart`
+ends it). On startup it compares that stamp to the clock:
+
+- back within `RESUME_MAX_GAP_S` (default 900) → the session resumes with its
+  true start, and the record it eventually writes is indistinguishable from one
+  that spanned no restart;
+- longer, or the process was killed without running its shutdown hook → the
+  session is closed as `truncated` at the last snapshot actually seen, since the
+  stop we missed could be anywhere in the gap.
+
+Set `RECORDER_STATE=` (empty) to disable persistence. The file is disposable —
+deleting it costs at most the session open at that moment.
+
+Two things it deliberately does not cover: a snapshot published while the
+recorder is down is only replayed if the bar publishes it at QoS 1 (mosquitto
+does not queue QoS 0 for an offline subscriber), and a broker disconnect still
+truncates the open session immediately, which splits a session that spans a
+network blip.
 
 ### Merging an out-of-band log
 
