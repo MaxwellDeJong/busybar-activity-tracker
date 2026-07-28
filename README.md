@@ -46,6 +46,7 @@ backend/     recorder + linker (one image, two entrypoints; needs paho-mqtt)
   activity_recorder.py   snapshot → session state machine, --flow-overtime, --self-test
   mqtt_linker.py         completes the device's account link so it starts publishing
   busy_probe.py          read-only protocol client for the WS fallback (needs busylib)
+  merge_activity_logs.py one-shot: fold an out-of-band log into the live one
 frontend/    dashboard — reads the log, renders the interactive views
   dashboard.py           Streamlit app (Day / Week / Month / Heatmap)
   dashboard_data.py      load / filter / shape pipeline (also used by the CLI)
@@ -221,6 +222,40 @@ Each line of `data/activity_log.jsonl`:
 - `partial` — session was open at connect (start time approximate)
 - `truncated` — session force-closed at last-seen snapshot on a stream drop
 - `overtime_s` — work beyond the timer, in `--flow-overtime` mode
+
+The log is **append-only**: the recorder only ever opens it `"a"`, and nothing in
+the stack rewrites or deletes a line. Treat it that way by hand too.
+
+### Merging an out-of-band log
+
+The one exception is folding in a log recorded elsewhere — e.g. the pre-MQTT log
+from the USB-tethered laptop, which holds sessions the homelab never saw.
+`backend/merge_activity_logs.py` does that without breaking the discipline: it
+picks between whole records (never edits one), archives the pre-merge log
+read-only, and swaps the result in with a single atomic rename, so the dashboard
+never reads a half-written file. Sessions are keyed on the device's own
+timestamp, so the two transports agree to the millisecond; where both logs saw a
+session, the more complete observation wins (non-`truncated`, then longer, then
+non-`partial`).
+
+Stop the recorder for the swap — the broker buffers its QoS-1 snapshots (durable
+session, fixed client_id) and replays them on restart, so nothing is lost:
+
+```bash
+docker compose stop recorder
+docker compose run --rm --no-deps \
+  -v "$PWD/backend/merge_activity_logs.py:/app/merge_activity_logs.py:ro" \
+  -v "$PWD/historic_activity_log.jsonl:/import/historic.jsonl:ro" \
+  recorder python merge_activity_logs.py \
+    --from /import/historic.jsonl --log /data/activity_log.jsonl --dry-run
+# drop --dry-run to apply, then:
+docker compose start recorder
+```
+
+Running it in the container keeps `data/` root-owned (no host `sudo`). Add
+`--dry-run` first: it prints what would be added, kept, and superseded, and
+aborts rather than dropping any existing record. Pre-merge copies land in
+`data/archive/` at mode 444.
 
 ## Related repositories & artifacts
 
