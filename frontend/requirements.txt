@@ -1,5 +1,8 @@
 # Frontend (dashboard) dependencies. activity_summary.py / dashboard_data.py core
-# need only pandas; the Streamlit app adds the UI + charting layer.
-streamlit
-plotly
+# need only pandas; the Streamlit app adds the UI layer (views are plain HTML).
+# Pinned exactly: the page CSS/JS targets Streamlit's rendered markup (test ids,
+# st-key-* classes, the date field), which changes between releases — e.g. 1.64
+# replaced the date <input> with editable segments that summon the keyboard.
+# Re-verify the views on a phone before bumping.
+streamlit==1.60.0
 pandas
