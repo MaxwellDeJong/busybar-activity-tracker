@@ -206,68 +206,98 @@ class RealLogSanityTests(unittest.TestCase):
         self.assertAlmostEqual(prod.loc[D21], expect_min, places=6)
 
 
-class HeatmapGridTests(unittest.TestCase):
-    def test_calendar_grid_aligns_to_monday(self):
-        import dashboard_viz as viz
-        # 7/22/26 is a Wednesday -> grid starts on Monday 7/20; 7/20..8/2 = 2 weeks.
-        grid_start, num_weeks = viz.calendar_grid(D22, dt.date(2026, 8, 2))
-        self.assertEqual(grid_start, dt.date(2026, 7, 20))
-        self.assertEqual(grid_start.weekday(), 0)
-        self.assertEqual(num_weeks, 2)
+class PeriodViewTests(unittest.TestCase):
+    """Week / Month / Heatmap shaping. Fixture: 7/20 (Mon) has 10m, 7/21 has
+    dev 2m + 3m and work 5m; 'today' is Wed 7/22, so Thu..Sun are future."""
 
-    def test_date_from_cell_roundtrips(self):
-        import dashboard_viz as viz
-        start, end = D22, dt.date(2026, 9, 30)
-        grid_start, num_weeks = viz.calendar_grid(start, end)
-        # Every day in range maps to a (col, row) that inverts back to the same day.
-        day = start
-        while day <= end:
-            col = (day - grid_start).days // 7
-            row = day.weekday()
-            self.assertEqual(viz.date_from_cell(grid_start, col, row), day)
-            day += dt.timedelta(days=1)
-
-    def test_build_heatmap_places_values(self):
-        import pandas as pd
-        import dashboard_viz as viz
-        start, end = D20, dt.date(2026, 8, 2)   # Mon .. Sun, 2 weeks
-        values = pd.Series({D20: 30.0, D22: 120.0})   # minutes; Mon wk0, Wed wk0
-        hover = {D20: "mon", D22: "wed"}
-        fig = viz.build_heatmap(values, hover, start, end)
-        self.assertEqual(len(fig.data), 1)
-        m = fig.data[0]
-        # One clickable square marker per calendar day in range (14 days).
-        self.assertEqual(m.mode, "markers")
-        self.assertEqual(len(m.x), 14)
-        cell = {(x, y): c for x, y, c in zip(m.x, m.y, m.marker.color)}
-        # color is shown in hours (minutes / 60), positioned by (week col, weekday row)
-        self.assertAlmostEqual(cell[(0, 0)], 0.5)   # Mon, week 0 -> 30 min = 0.5 h
-        self.assertAlmostEqual(cell[(0, 2)], 2.0)   # Wed, week 0 -> 120 min = 2 h
-        self.assertEqual(cell[(0, 1)], 0.0)         # Tue 7/21, in range, no value
-
-
-class StackedBarTests(unittest.TestCase):
-    def test_build_stacked_daily_places_segments(self):
-        import pandas as pd
-        import dashboard_viz as viz
+    def setUp(self):
+        import tempfile
         import dashboard_theme as theme
-        # Two days, two activities; one gap-ish cell is zero.
-        pivot = pd.DataFrame(
-            {"development": [5.0, 0.0], "work": [5.0, 10.0]},
-            index=[D20, D21],
-        )
-        colors = theme.activity_colors(pivot.columns)
-        fig = viz.build_stacked_daily(pivot, colors, xlabel_fmt="%a %-m/%-d")
-        # One trace per activity, stacked.
-        self.assertEqual(fig.layout.barmode, "stack")
-        self.assertEqual({t.name for t in fig.data}, {"development", "work"})
-        work = next(t for t in fig.data if t.name == "work")
-        self.assertEqual(list(work.y), [5.0, 10.0])
-        # customdata[0] carries the ISO day for click-to-drill.
-        self.assertEqual(work.customdata[0][0], D20.isoformat())
-        self.assertEqual(work.customdata[1][0], D21.isoformat())
-        # <=4 visible activities are direct-labeled on their peak day only.
-        self.assertEqual(list(work.text), ["", "work"])
+        self.tmp = tempfile.TemporaryDirectory()
+        self.df = dd.load_prepared(write_fixture(self.tmp.name))
+        self.colors = theme.activity_colors(self.df["activity"].unique())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def period(self, start, end):
+        import dashboard_period as period
+        return period.summarize_period(dd.range_sessions(self.df, start, end), start, end,
+                                       self.colors, D22)
+
+    def heatmap(self, start, end, activity=None):
+        import dashboard_period as period
+        return period.summarize_heatmap(dd.range_sessions(self.df, start, end), start, end,
+                                        self.colors, D22, activity=activity)
+
+    def test_week_summary(self):
+        s = self.period(D20, D20 + dt.timedelta(days=6))
+        self.assertEqual(len(s["days"]), 7)
+        self.assertAlmostEqual(s["total_s"], 1200.0)
+        self.assertEqual((s["active_days"], s["elapsed_days"]), (2, 3))
+        self.assertEqual(sum(d["future"] for d in s["days"]), 4)
+        tue = s["days"][1]
+        # Segments stack in alphabetical order with their palette colors.
+        self.assertEqual([(a, v) for a, v, _ in tue["segments"]],
+                         [("development", 300.0), ("work", 300.0)])
+        self.assertEqual(tue["segments"][1][2], self.colors["work"])
+
+    def test_week_html_only_past_days_drill(self):
+        import dashboard_period as period
+        s = self.period(D20, D20 + dt.timedelta(days=6))
+        page = period.render_week_html(s, D22, "UTC")
+        self.assertEqual(page.count("data-bb-day="), 3)
+        self.assertEqual(page.count(" disabled "), 4)
+        self.assertIn("This week", page)
+        self.assertIn("July 20 – 26", page)
+
+    def test_week_labels_across_years(self):
+        import dashboard_period as period
+        eyebrow, title = period.week_labels(dt.date(2025, 12, 29), dt.date(2026, 1, 10))
+        self.assertEqual(eyebrow, "Last week")
+        self.assertEqual(title, "Dec 29, 2025 – Jan 4, 2026")
+
+    def test_month_calendar_pads_to_weekday(self):
+        import dashboard_period as period
+        first, last = dd.month_bounds(D21)
+        s = self.period(first, last)
+        page = period.render_month_html(s, D22, "UTC")
+        # 7/1/2026 is a Wednesday: two blank cells before it.
+        self.assertEqual(page.count('class="bb-cal-pad"'), first.weekday())
+        self.assertEqual(page.count("bb-cal-day"), 31)
+        self.assertEqual(page.count("data-bb-day="), 22)    # 7/1 .. 7/22 (today)
+        self.assertIn("This month", page)
+
+    def test_heatmap_levels_and_streaks(self):
+        import dashboard_period as period
+        s = self.heatmap(dt.date(2026, 7, 1), D22)
+        self.assertEqual(s["values"], {D20: 600.0, D21: 600.0})
+        self.assertEqual((s["active_days"], s["peak"]), (2, 600.0))
+        # Today (7/22) is untracked so far; the streak still counts 7/20-7/21.
+        self.assertEqual((s["streak"], s["longest"]), (2, 2))
+        self.assertEqual(s["months"], [(2026, 7)])
+        self.assertEqual([period.level(v, 600.0) for v in (0, 1, 150, 151, 600)],
+                         [0, 1, 1, 2, 4])
+
+    def test_heatmap_single_activity(self):
+        s = self.heatmap(dt.date(2026, 7, 1), D22, activity="work")
+        self.assertEqual(s["values"], {D21: 300.0})
+        self.assertEqual(s["color"], self.colors["work"])
+        # The breakdown still covers every activity in range.
+        self.assertEqual(len(s["activities"]), 3)
+
+    def test_heatmap_months_newest_first_across_years(self):
+        s = self.heatmap(dt.date(2025, 11, 15), dt.date(2026, 2, 3))
+        self.assertEqual(s["months"], [(2026, 2), (2026, 1), (2025, 12), (2025, 11)])
+
+    def test_heatmap_html_out_of_range_days_are_inert(self):
+        import dashboard_period as period
+        start = D20
+        s = self.heatmap(start, D22)
+        page = period.render_heatmap_html(s, D22, "UTC", "Last 3 days", None)
+        self.assertEqual(page.count("data-bb-day="), 3)     # 7/20 .. 7/22
+        self.assertEqual(page.count("is-out"), 31 - 3)
+        self.assertIn("lv-4", page)
 
 
 class DayViewTests(unittest.TestCase):

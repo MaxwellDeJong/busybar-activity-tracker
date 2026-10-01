@@ -1,21 +1,20 @@
-"""Day view: summary shaping + hand-built HTML (no Plotly, no Streamlit).
+"""Day view: summary shaping + hand-built HTML (no Streamlit).
 
 The Day view is the page most often opened on a phone, where Plotly's hover-driven
 charts work poorly: a tap is needed to read anything, and a 24 h axis squeezed into
 ~360 px turns sessions into slivers. So this view is plain HTML/CSS rendered with
 ``st.html``: a hero total, a ribbon zoomed to the hours actually worked, a
 per-activity breakdown, and a chronological session list that carries every detail
-without hover. Styles live in dashboard.py's global CSS (``.bb-*`` classes) and
-are derived from ``currentColor`` so the page follows Streamlit's light/dark theme.
+without hover. Shared pieces (hero, cards, breakdown) come from dashboard_html.
 
 `summarize_day` is pure data (unit-tested); `render_day_html` turns it into markup.
 """
 from __future__ import annotations
 
 import datetime as dt
-import html
 
 import dashboard_data as dd
+import dashboard_html as h
 import dashboard_theme as theme
 
 # Breaks shorter than this are folded silently into the session list.
@@ -25,10 +24,7 @@ MIN_GAP_S = 10 * 60
 MIN_RIBBON_HOURS = 6
 
 
-def pretty_name(activity):
-    """'tech_reading' -> 'Tech reading' for display; the raw key stays the color key."""
-    text = str(activity).replace("_", " ").strip()
-    return text[:1].upper() + text[1:] if text else str(activity)
+pretty_name = h.pretty_name
 
 
 def _naive(ts):
@@ -104,15 +100,7 @@ def summarize_day(sessions, day, color_map, now=None):
     rows.sort(key=lambda s: s["start"])
 
     total_s = sum(s["duration_s"] for s in rows)
-    per = {}
-    for s in rows:
-        per[s["activity"]] = per.get(s["activity"], 0.0) + s["duration_s"]
-    activities = [
-        {"activity": a, "seconds": v, "share": v / total_s if total_s else 0.0,
-         "count": sum(1 for s in rows if s["activity"] == a),
-         "color": color_map.get(a, theme.OTHER_COLOR)}
-        for a, v in sorted(per.items(), key=lambda kv: (-kv[1], kv[0]))
-    ]
+    activities = h.activity_totals(((s["activity"], s["duration_s"]) for s in rows), color_map)
 
     items, prev_end = [], None
     for i, s in enumerate(rows):
@@ -135,24 +123,8 @@ def summarize_day(sessions, day, color_map, now=None):
 # --------------------------------------------------------------------------- #
 # HTML                                                                        #
 # --------------------------------------------------------------------------- #
-def _esc(s):
-    return html.escape(str(s), quote=True)
-
-
 def _clock(t):
     return t.strftime("%H:%M")
-
-
-def _big_duration(seconds):
-    """'7h 33m' with the unit letters set small (hero figure)."""
-    total_min = int(round(seconds / 60.0))
-    h, m = divmod(total_min, 60)
-    parts = []
-    if h:
-        parts.append(f'{h}<span class="bb-unit">h</span>')
-    if m or not h:
-        parts.append(f'{m}<span class="bb-unit">m</span>')
-    return " ".join(parts)
 
 
 def _relative_label(day, today):
@@ -194,8 +166,8 @@ def _ribbon(summary, now):
         tip = (f'{pretty_name(s["activity"])} · {_clock(s["start"])}–{_clock(s["end"])}'
                f' · {dd.fmt_duration(s["duration_s"], "minute")}')
         segs.append(
-            f'<button type="button" class="bb-seg" data-bb-session="{i}" title="{_esc(tip)}" '
-            f'aria-label="{_esc(tip)}" '
+            f'<button type="button" class="bb-seg" data-bb-session="{i}" title="{h.esc(tip)}" '
+            f'aria-label="{h.esc(tip)}" '
             f'style="left:{left:.3f}%;width:{width:.3f}%;background:{s["color"]}"></button>'
         )
     if now is not None and lo <= now <= hi:
@@ -213,24 +185,6 @@ def _ribbon(summary, now):
             f'<div class="bb-ticks">{ticks}</div></div>')
 
 
-def _breakdown(summary):
-    rows = []
-    for a in summary["activities"]:
-        n = a["count"]
-        rows.append(
-            '<li class="bb-act">'
-            f'<div class="bb-act-head"><span class="bb-dot" style="background:{a["color"]}"></span>'
-            f'<span class="bb-act-name">{_esc(pretty_name(a["activity"]))}</span>'
-            f'<span class="bb-act-time">{dd.fmt_duration(a["seconds"], "minute")}</span></div>'
-            f'<div class="bb-act-bar"><span style="width:{a["share"] * 100:.2f}%;'
-            f'background:{a["color"]}"></span></div>'
-            f'<div class="bb-act-meta">{round(a["share"] * 100)}% · '
-            f'{n} session{"s" if n != 1 else ""}</div>'
-            '</li>'
-        )
-    return f'<ul class="bb-acts">{"".join(rows)}</ul>'
-
-
 def _session_list(summary):
     out = []
     for it in summary["items"]:
@@ -243,7 +197,7 @@ def _session_list(summary):
             f'style="--c:{it["color"]}">'
             f'<span class="bb-sess-time">{_clock(it["start"])}<span class="bb-sess-end">'
             f'{_clock(it["end"])}</span></span>'
-            f'<span class="bb-sess-name">{_esc(pretty_name(it["activity"]))}</span>'
+            f'<span class="bb-sess-name">{h.esc(pretty_name(it["activity"]))}</span>'
             f'<span class="bb-sess-dur">{dd.fmt_duration(it["duration_s"], "minute")}</span>'
             '</li>'
         )
@@ -253,36 +207,23 @@ def _session_list(summary):
 def render_day_html(summary, day, today, tzname, now=None):
     """The Day view body as one HTML string (``summary`` from `summarize_day`,
     or None for an empty day)."""
-    hero_top = (f'<div class="bb-eyebrow">{_esc(_relative_label(day, today))}</div>'
-                f'<div class="bb-date">{_esc(_date_title(day, today))}</div>')
-    foot = (f'<p class="bb-foot">Day runs 03:00 → 03:00 {_esc(tzname)} · '
-            'sessions under a minute and rest breaks are hidden</p>')
-
+    eyebrow, title = _relative_label(day, today), _date_title(day, today)
     if summary is None:
-        return (f'<div class="bb-day"><header class="bb-hero">{hero_top}</header>'
-                '<section class="bb-card bb-empty">'
-                '<div class="bb-empty-title">Nothing tracked</div>'
-                '<div class="bb-empty-sub">No sessions of a minute or longer on this day. '
-                'Swipe or use the arrows to browse other days.</div>'
-                f'</section>{foot}</div>')
+        return h.page(h.hero(eyebrow, title)
+                      + h.empty_card("No sessions of a minute or longer on this day. "
+                                     "Swipe or use the arrows to browse other days.")
+                      + h.footnote(tzname), "bb-day")
 
-    n_act = len(summary["activities"])
     facts = [
-        f'{summary["count"]} session{"s" if summary["count"] != 1 else ""}',
-        f'{n_act} activit{"ies" if n_act != 1 else "y"}',
+        h.plural(summary["count"], "session"),
+        h.plural(len(summary["activities"]), "activity", "activities"),
         f'{_clock(summary["first_start"])} – {_clock(summary["last_end"])}',
     ]
-    hero = (
-        f'<header class="bb-hero">{hero_top}'
-        f'<div class="bb-total">{_big_duration(summary["total_s"])}</div>'
-        f'<div class="bb-facts">{"".join(f"<span>{_esc(f)}</span>" for f in facts)}</div>'
-        '</header>'
-    )
-    timeline = (f'<section class="bb-card"><div class="bb-label">Timeline</div>'
-                f'{_ribbon(summary, now)}</section>')
-    breakdown = (f'<section class="bb-card"><div class="bb-label">By activity</div>'
-                 f'{_breakdown(summary)}</section>')
-    sessions = (f'<section class="bb-card"><div class="bb-label">Sessions</div>'
-                f'{_session_list(summary)}</section>')
-    return (f'<div class="bb-day">{hero}{timeline}'
-            f'<div class="bb-cols">{breakdown}{sessions}</div>{foot}</div>')
+    return h.page(
+        h.hero(eyebrow, title, summary["total_s"], facts)
+        + h.card("Timeline", _ribbon(summary, now))
+        + '<div class="bb-cols">'
+        + h.card("By activity", h.breakdown(summary["activities"]))
+        + h.card("Sessions", _session_list(summary))
+        + "</div>" + h.footnote(tzname),
+        "bb-day")

@@ -48,10 +48,12 @@ backend/     recorder + linker (one image, two entrypoints; needs paho-mqtt)
   busy_probe.py          read-only protocol client for the WS fallback (needs busylib)
   merge_activity_logs.py one-shot: fold an out-of-band log into the live one
 frontend/    dashboard — reads the log, renders the interactive views
-  dashboard.py           Streamlit app (Day / Week / Month / Heatmap)
+  dashboard.py           Streamlit app shell: view tabs, nav, page CSS + touch handling
+  dashboard_day.py       Day view (timeline ribbon, breakdown, session list)
+  dashboard_period.py    Week / Month / Heatmap views
+  dashboard_html.py      shared HTML pieces (hero, cards, breakdown, formatting)
   dashboard_data.py      load / filter / shape pipeline (also used by the CLI)
-  dashboard_viz.py       Plotly figures
-  dashboard_theme.py     palette + Plotly theming
+  dashboard_theme.py     activity palette + color assignment
   activity_summary.py    single-day CLI summary
 config/      activity_card_id_map.json — the one coordination point with firmware
 data/        activity_log.jsonl + recorder_state.json + linker_state.json
