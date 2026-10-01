@@ -16,6 +16,7 @@ import os
 import streamlit as st
 
 import dashboard_data as dd
+import dashboard_day as day_view
 import dashboard_theme as theme
 import dashboard_viz as viz
 
@@ -51,7 +52,202 @@ _CSS = """
   section[data-testid="stSidebar"] h2 {
     font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.06em; opacity: 0.6;
   }
+  @media (max-width: 640px) {
+    [data-testid="stMainBlockContainer"] { padding: 3.6rem 1rem 3rem; }
+    .st-key-masthead h1 { font-size: 1.35rem; padding: 0; }
+    .st-key-masthead [data-testid="stCaptionContainer"] { display: none; }
+  }
+
+  /* ---- Day view (markup from dashboard_day) ------------------------------
+     Tones are mixed from currentColor, so the page follows whichever light/dark
+     theme Streamlit is showing; only the activity colors are fixed. */
+  .st-key-day_nav { flex-wrap: nowrap; gap: 0.5rem; }
+  .st-key-day_nav button { min-height: 2.75rem; }
+  .st-key-day_prev button, .st-key-day_next button { width: 2.75rem; padding: 0; }
+  .st-key-day_nav kbd { display: none; }   /* ←/→ still work; the hint is noise on a phone */
+  .st-key-day_nav [data-testid="stDateInput"] { flex: 1 1 auto; min-width: 0; }
+  .st-key-day_nav input { font-size: 16px; min-height: 2.6rem; }  /* 16px: no iOS focus zoom */
+  @media (min-width: 641px) { .st-key-day_nav [data-testid="stDateInput"] { flex: 0 1 13rem; } }
+
+  .bb-day {
+    --fg2: color-mix(in srgb, currentColor 66%, transparent);
+    --fg3: color-mix(in srgb, currentColor 48%, transparent);
+    --line: color-mix(in srgb, currentColor 11%, transparent);
+    --wash: color-mix(in srgb, currentColor 3.5%, transparent);
+    font-variant-numeric: tabular-nums;
+    -webkit-tap-highlight-color: transparent;
+  }
+  .bb-hero { padding: 0.5rem 0.15rem 1.2rem; }
+  .bb-eyebrow {
+    font-size: 0.72rem; font-weight: 650; letter-spacing: 0.09em;
+    text-transform: uppercase; color: var(--fg3);
+  }
+  .bb-date { font-size: 1.15rem; font-weight: 600; margin-top: 0.15rem; }
+  .bb-total {
+    font-size: 3.4rem; font-weight: 700; letter-spacing: -0.04em; line-height: 1;
+    margin-top: 1rem;
+  }
+  .bb-unit {
+    font-size: 0.42em; font-weight: 600; letter-spacing: 0; color: var(--fg3);
+    margin-left: 0.08em;
+  }
+  .bb-facts {
+    display: flex; flex-wrap: wrap; gap: 0.2rem 0.5rem; margin-top: 0.7rem;
+    color: var(--fg2); font-size: 0.92rem;
+  }
+  .bb-facts span + span::before { content: "·"; margin-right: 0.5rem; color: var(--fg3); }
+
+  .bb-card {
+    border: 1px solid var(--line); border-radius: 16px; background: var(--wash);
+    padding: 1rem 1.1rem 1.1rem; margin-bottom: 0.9rem;
+  }
+  .bb-label {
+    font-size: 0.72rem; font-weight: 650; letter-spacing: 0.08em;
+    text-transform: uppercase; color: var(--fg3); margin-bottom: 0.9rem;
+  }
+
+  .bb-track {
+    position: relative; height: 3rem; border-radius: 10px;
+    background: color-mix(in srgb, currentColor 5%, transparent);
+  }
+  .bb-grid { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--line); }
+  .bb-seg {
+    position: absolute; top: 0; bottom: 0; min-width: 3px;
+    border: 0; padding: 0; border-radius: 5px; cursor: pointer;
+    transition: filter 0.15s, transform 0.15s;
+  }
+  .bb-seg:hover, .bb-seg:focus-visible { filter: brightness(1.15); transform: scaleY(1.08); outline: none; }
+  .bb-now {
+    position: absolute; top: -5px; bottom: -5px; width: 2px; margin-left: -1px;
+    background: currentColor; border-radius: 1px; pointer-events: none;
+  }
+  .bb-now::before {
+    content: ""; position: absolute; top: -3px; left: -3px;
+    width: 8px; height: 8px; border-radius: 50%; background: currentColor;
+  }
+  .bb-ticks { position: relative; height: 1.1rem; margin-top: 0.45rem; }
+  .bb-tick {
+    position: absolute; transform: translateX(-50%); white-space: nowrap;
+    font-size: 0.72rem; color: var(--fg3);
+  }
+
+  .bb-day ul.bb-acts { list-style: none; margin: 0; padding: 0; display: grid; gap: 1rem; }
+  .bb-act { margin: 0; }
+  .bb-act-head { display: flex; align-items: center; gap: 0.6rem; font-size: 0.97rem; }
+  .bb-dot { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+  .bb-act-name {
+    flex: 1; min-width: 0; font-weight: 550;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .bb-act-time { font-weight: 650; }
+  .bb-act-bar {
+    height: 6px; border-radius: 3px; margin: 0.5rem 0 0.3rem; overflow: hidden;
+    background: color-mix(in srgb, currentColor 7%, transparent);
+  }
+  .bb-act-bar span { display: block; height: 100%; border-radius: 3px; }
+  .bb-act-meta { font-size: 0.78rem; color: var(--fg3); }
+
+  .bb-day ol.bb-sessions { list-style: none; margin: 0 -0.4rem; padding: 0; }
+  .bb-sess {
+    position: relative; display: grid; grid-template-columns: 3.3rem 1fr auto;
+    align-items: center; gap: 0.75rem; margin: 0;
+    padding: 0.6rem 0.5rem 0.6rem 1.05rem; border-radius: 10px;
+  }
+  .bb-sess::before {
+    content: ""; position: absolute; left: 0.4rem; top: 0.6rem; bottom: 0.6rem;
+    width: 4px; border-radius: 2px; background: var(--c);
+  }
+  .bb-sess + .bb-sess::after {
+    content: ""; position: absolute; top: 0; left: 1.05rem; right: 0.5rem;
+    border-top: 1px solid var(--line);
+  }
+  .bb-sess-time { display: flex; flex-direction: column; font-weight: 600; font-size: 0.92rem; line-height: 1.25; }
+  .bb-sess-end { font-weight: 400; font-size: 0.78rem; color: var(--fg3); }
+  .bb-sess-name {
+    font-size: 0.97rem; min-width: 0;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .bb-sess-dur { font-weight: 600; font-size: 0.92rem; color: var(--fg2); }
+  .bb-gap {
+    display: flex; align-items: center; gap: 0.6rem; margin: 0;
+    padding: 0.3rem 0.5rem 0.3rem 1.05rem; font-size: 0.75rem; color: var(--fg3);
+  }
+  .bb-gap::before { content: ""; flex: 0 0 3.3rem; border-top: 1px dashed var(--line); }
+  .bb-gap::after { content: ""; flex: 1; border-top: 1px dashed var(--line); }
+  .bb-flash { animation: bb-flash 1.8s ease-out; }
+  @keyframes bb-flash {
+    from { background: color-mix(in srgb, var(--c) 24%, transparent); }
+    to { background: transparent; }
+  }
+
+  .bb-empty { text-align: center; padding: 2.6rem 1.2rem; }
+  .bb-empty-title { font-weight: 650; font-size: 1.05rem; }
+  .bb-empty-sub { color: var(--fg2); font-size: 0.92rem; margin-top: 0.35rem; }
+  .bb-foot { font-size: 0.75rem; color: var(--fg3); margin: 0.6rem 0.15rem 0; }
+
+  @media (min-width: 860px) {
+    .bb-total { font-size: 4.2rem; }
+    .bb-cols { display: grid; grid-template-columns: 5fr 7fr; gap: 0.9rem; align-items: start; }
+    .bb-cols .bb-card { margin-bottom: 0; }
+    .bb-foot { margin-top: 1rem; }
+  }
 </style>
+"""
+
+# Day-view touch handling, installed once per page (st.html re-runs the script on
+# every rerun; the window flag keeps listeners from stacking):
+#   * a horizontal swipe anywhere on the page presses the ‹ / › nav buttons;
+#   * tapping a ribbon segment scrolls to and highlights its session row;
+#   * the date field gets inputmode=none so tapping it opens only the calendar,
+#     not the on-screen keyboard, and the icon-only ‹ / › buttons get labels.
+_DAY_JS = """
+<script>
+(() => {
+  if (window.__bbDayInstalled) return;
+  window.__bbDayInstalled = true;
+  const SKIP = 'input, textarea, [data-baseweb="popover"], [data-testid="stSidebar"], .js-plotly-plot';
+  let start = null;
+  document.addEventListener('touchstart', (e) => {
+    start = null;
+    if (e.touches.length !== 1 || e.target.closest(SKIP)) return;
+    if (!document.querySelector('.st-key-day_nav')) return;
+    const t = e.touches[0];
+    start = { x: t.clientX, y: t.clientY, at: Date.now() };
+  }, { passive: true });
+  document.addEventListener('touchend', (e) => {
+    if (!start) return;
+    const t = e.changedTouches[0];
+    const dx = t.clientX - start.x, dy = t.clientY - start.y;
+    const quick = Date.now() - start.at < 700;
+    start = null;
+    if (!quick || Math.abs(dx) < 60 || Math.abs(dx) < 2 * Math.abs(dy)) return;
+    const btn = document.querySelector(dx < 0 ? '.st-key-day_next button' : '.st-key-day_prev button');
+    if (btn && !btn.disabled) btn.click();
+  }, { passive: true });
+  document.addEventListener('click', (e) => {
+    const seg = e.target.closest('.bb-seg');
+    if (!seg) return;
+    const row = document.getElementById('bb-session-' + seg.dataset.bbSession);
+    if (!row) return;
+    row.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    row.classList.remove('bb-flash');
+    void row.offsetWidth;                      // restart the animation
+    row.classList.add('bb-flash');
+  });
+  // Icon-only st.buttons render aria-label="", so name them for screen readers.
+  const LABELS = { day_prev: 'Previous day', day_next: 'Next day' };
+  const fixNav = () => {
+    document.querySelectorAll('.st-key-day_nav input:not([inputmode="none"])')
+      .forEach((el) => el.setAttribute('inputmode', 'none'));
+    for (const [key, label] of Object.entries(LABELS)) {
+      document.querySelectorAll(`.st-key-${key} button:not([aria-label="${label}"])`)
+        .forEach((el) => el.setAttribute('aria-label', label));
+    }
+  };
+  new MutationObserver(fixNav).observe(document.body, { childList: true, subtree: true });
+  fixNav();
+})();
+</script>
 """
 
 
@@ -79,49 +275,39 @@ def today_logical():
 # --------------------------------------------------------------------------- #
 # Day view                                                                    #
 # --------------------------------------------------------------------------- #
+def _set_day(day):
+    # Never navigate past today: future days are always empty.
+    st.session_state.day = min(day, today_logical())
+
+
 def render_day(df, color_map):
     if "day" not in st.session_state:
         st.session_state.day = today_logical()
-
-    # Navigation row.
-    c_prev, c_today, c_next, c_pick = st.columns([1, 1, 1, 4])
-    if c_prev.button("Prev", icon=":material/chevron_left:", width="stretch"):
-        st.session_state.day -= dt.timedelta(days=1)
-        st.rerun()
-    if c_today.button("Today", icon=":material/today:", width="stretch"):
-        st.session_state.day = today_logical()
-        st.rerun()
-    if c_next.button("Next", icon=":material/chevron_right:", width="stretch"):
-        st.session_state.day += dt.timedelta(days=1)
-        st.rerun()
-    picked = c_pick.date_input("Day", value=st.session_state.day, label_visibility="collapsed")
-    if picked != st.session_state.day:
-        st.session_state.day = picked
-        st.rerun()
-
+    today = today_logical()
     day = st.session_state.day
-    tzname = dt.datetime.now().astimezone().tzname() or "local"
-    st.caption(f"**{day:%a %-m/%-d/%Y}** · day = 03:00→03:00 {tzname} · sessions <1m hidden")
 
-    sessions = dd.day_sessions(df, day)
-    if sessions.empty:
-        st.info("No sessions of one minute or longer for this day.")
-        return
+    # One row at every width (st.columns would stack this on a phone):
+    # ‹ [date] › Today. Callbacks rather than st.rerun() so a tap costs one run.
+    with st.container(horizontal=True, vertical_alignment="center", key="day_nav"):
+        st.button("", icon=":material/chevron_left:", key="day_prev", help="Previous day",
+                  shortcut="left",
+                  on_click=_set_day, args=(day - dt.timedelta(days=1),))
+        picked = st.date_input("Day", value=day, max_value=today,
+                               label_visibility="collapsed", format="MM/DD/YYYY")
+        st.button("", icon=":material/chevron_right:", key="day_next", help="Next day",
+                  shortcut="right",
+                  on_click=_set_day, args=(day + dt.timedelta(days=1),),
+                  disabled=day >= today)
+        st.button("Today", key="day_today", on_click=_set_day, args=(today,),
+                  disabled=day == today)
+    if picked != day:
+        _set_day(picked)
+        st.rerun()
 
-    # Headline stats.
-    total_s = float(sessions["duration_s"].sum())
-    m1, m2, m3 = st.columns(3)
-    m1.metric("Productive total", dd.fmt_duration(total_s, "minute"), border=True)
-    m2.metric("Sessions", len(sessions), border=True)
-    m3.metric("Activities", sessions["activity"].nunique(), border=True)
-
-    # Timeline (primary) + totals (secondary).
-    st.subheader("Timeline")
-    st.plotly_chart(viz.build_day_timeline(sessions, day, color_map),
-                    width="stretch", theme=None, config=PLOTLY_CONFIG)
-    st.subheader("Total per activity")
-    st.plotly_chart(viz.build_activity_totals(sessions, color_map),
-                    width="stretch", theme=None, config=PLOTLY_CONFIG)
+    now = dt.datetime.now().astimezone().replace(tzinfo=None)
+    summary = day_view.summarize_day(dd.day_sessions(df, day), day, color_map, now=now)
+    st.html(day_view.render_day_html(summary, day, today, _tzname(), now=now))
+    st.html(_DAY_JS, unsafe_allow_javascript=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -407,8 +593,9 @@ def main():
             st.rerun()
         st.caption(f"Source `{os.path.basename(dd.DEFAULT_LOG)}`")
 
-    st.title("Busy Bar")
-    st.caption("A quiet look at where the time goes — heatmap down to the day.")
+    with st.container(key="masthead"):
+        st.title("Busy Bar")
+        st.caption("A quiet look at where the time goes — heatmap down to the day.")
 
     df = get_data(dd.DEFAULT_LOG)
     if df.empty:

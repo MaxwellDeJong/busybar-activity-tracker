@@ -13,9 +13,6 @@ import plotly.graph_objects as go
 import dashboard_data as dd
 import dashboard_theme as theme
 
-# Logical day window: [day 03:00, next day 03:00).
-DAY_START_HOUR = dd.DAY_CUTOFF_HOUR
-
 # Above this many minutes a value axis reads more cleanly in hours than in minutes.
 _HOURS_THRESHOLD_MIN = 120
 
@@ -32,54 +29,8 @@ def _value_axis(max_minutes):
     return "minutes", 1.0
 
 
-def _day_window(day):
-    start = dt.datetime.combine(day, dt.time(DAY_START_HOUR, 0))
-    return start, start + dt.timedelta(days=1)
-
-
-def build_day_timeline(sessions, day, color_map):
-    """A single-lane time-of-day ribbon: one bar per session at its real clock
-    position, colored by activity. x-axis spans the full logical day (03:00->03:00).
-    """
-    win_start, win_end = _day_window(day)
-    fig = go.Figure()
-
-    # One trace per activity so the legend carries identity (color is not alone).
-    for activity in sorted(sessions["activity"].unique()):
-        rows = sessions[sessions["activity"] == activity]
-        starts, widths, custom = [], [], []
-        for _, r in rows.iterrows():
-            s = r["start_local"]
-            if hasattr(s, "to_pydatetime"):                # pandas Timestamp -> datetime
-                s = s.to_pydatetime()
-            s = s.replace(tzinfo=None)                      # already local; drop tz for plotting
-            starts.append(s)
-            widths.append(r["duration_s"] * 1000.0)         # bar width in ms
-            custom.append((activity, s.strftime("%H:%M"),
-                           dd.fmt_duration(r["duration_s"], "minute")))
-        fig.add_bar(
-            name=activity, y=["day"] * len(rows), x=widths, base=starts,
-            orientation="h", marker=dict(color=color_map.get(activity, theme.OTHER_COLOR),
-                                         line=dict(width=0)),
-            customdata=custom, offsetgroup="day", width=0.6,
-            hovertemplate="<b>%{customdata[0]}</b><br>start %{customdata[1]}"
-                          "<br>%{customdata[2]}<extra></extra>",
-        )
-
-    fig.update_layout(
-        barmode="overlay", height=150, showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-    )
-    fig.update_xaxes(
-        type="date", range=[win_start, win_end],
-        tickformat="%H:%M", dtick=3600000 * 3,   # a tick every 3 hours
-    )
-    fig.update_yaxes(showticklabels=False, showgrid=False, title=None)
-    return theme.apply_theme(fig)
-
-
 def build_activity_totals(sessions, color_map):
-    """Horizontal bar of total minutes per activity for the day, largest on top,
+    """Horizontal bar of total minutes per activity, largest on top,
     with direct duration labels (identity never rests on color alone)."""
     ink = theme.INK
     totals = sessions.groupby("activity")["duration_s"].sum().sort_values()  # asc -> largest on top
