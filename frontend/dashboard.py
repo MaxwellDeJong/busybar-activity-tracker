@@ -26,6 +26,9 @@ st.set_page_config(page_title="Busy Bar", page_icon="📊", layout="wide")
 
 VIEWS = ["Day", "Week", "Month", "Heatmap"]
 
+# How often an open Day page re-renders to keep a running timer current.
+LIVE_REFRESH_S = 30
+
 # Heatmap range presets: short tab label -> (days back, or None for all, eyebrow).
 RANGE_PRESETS = {
     "3 mo": (90, "Last 3 months"), "6 mo": (182, "Last 6 months"),
@@ -185,6 +188,37 @@ _CSS = """
   @keyframes bb-flash {
     from { background: color-mix(in srgb, var(--c) 24%, transparent); }
     to { background: transparent; }
+  }
+
+  /* A timer running right now: banner under the total, striped ribbon segment,
+     and a session row that ends "now". */
+  .bb-live {
+    display: flex; align-items: center; gap: 0.65rem; margin: -0.3rem 0 1.1rem;
+    padding: 0.7rem 0.95rem; border-radius: 14px; font-size: 0.92rem;
+    background: color-mix(in srgb, var(--c) 12%, transparent);
+    border: 1px solid color-mix(in srgb, var(--c) 35%, transparent);
+  }
+  .bb-pulse {
+    flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--c);
+    animation: bb-pulse 2s ease-out infinite;
+  }
+  @keyframes bb-pulse {
+    0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--c) 60%, transparent); }
+    70%, 100% { box-shadow: 0 0 0 9px transparent; }
+  }
+  .bb-live-text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bb-live-text b { font-weight: 650; }
+  .bb-live-dur { font-weight: 700; }
+  .bb-seg.is-live {
+    background-image: repeating-linear-gradient(-45deg, transparent 0 4px,
+                      rgba(255, 255, 255, 0.3) 4px 8px);
+  }
+  .bb-sess.is-live { background: color-mix(in srgb, var(--c) 8%, transparent); }
+  .bb-sess.is-live .bb-sess-end { color: inherit; font-weight: 700; }
+  .bb-sess.is-live::before { animation: bb-blink 2s ease-in-out infinite; }
+  @keyframes bb-blink { 50% { opacity: 0.35; } }
+  @media (prefers-reduced-motion: reduce) {
+    .bb-pulse, .bb-sess.is-live::before { animation: none; }
   }
 
   .bb-empty { text-align: center; padding: 2.6rem 1.2rem; }
@@ -448,15 +482,33 @@ def _show_page(markup, key):
 # --------------------------------------------------------------------------- #
 # Views                                                                       #
 # --------------------------------------------------------------------------- #
-def render_day(df, color_map):
+def render_day(_df, _color_map):
+    # The body loads its own data (it reruns alone as a fragment), so the frame
+    # and colors the other views take are unused here.
     today = today_logical()
     st.session_state.setdefault("day", today)
     day = st.session_state.day
     one = dt.timedelta(days=1)
     _period_nav("day", day, day - one, day + one, today, lambda d: d, "day")
 
-    now = dt.datetime.now().astimezone().replace(tzinfo=None)
-    summary = day_view.summarize_day(dd.day_sessions(df, day), day, color_map, now=now)
+    # Today's page — or the day a timer started on, if it's still running past
+    # the 03:00 cutoff — re-renders itself every LIVE_REFRESH_S, so the running
+    # session's time keeps up and finished sessions appear without a reload.
+    live = dd.load_live_session()
+    ticking = day == today or (live is not None and live["logical_day"] == day)
+    st.fragment(_day_body, run_every=LIVE_REFRESH_S if ticking else None)(day, today)
+
+
+def _day_body(day, today):
+    df = get_data(dd.DEFAULT_LOG)
+    color_map = theme.activity_colors(df["activity"].unique())
+    now_aware = dt.datetime.now().astimezone()
+    live = dd.load_live_session(now=now_aware)
+    if live is not None and live["logical_day"] != day:
+        live = None
+    now = now_aware.replace(tzinfo=None)
+    summary = day_view.summarize_day(dd.day_sessions(df, day), day, color_map,
+                                     now=now, live=live)
     st.html(day_view.render_day_html(summary, day, today, _tzname(), now=now))
 
 

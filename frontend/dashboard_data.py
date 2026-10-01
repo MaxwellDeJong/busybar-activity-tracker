@@ -35,6 +35,14 @@ _ROOT = os.path.dirname(_HERE)   # repo root: frontend/ and data/ + config/ are 
 DEFAULT_LOG = os.environ.get("ACTIVITY_LOG") or os.path.join(_ROOT, "data", "activity_log.jsonl")
 DEFAULT_CARD_MAP = (os.environ.get("CARD_MAP")
                     or os.path.join(_ROOT, "config", "activity_card_id_map.json"))
+# The recorder mirrors its open session here; it lives beside the log in data/.
+DEFAULT_STATE = (os.environ.get("RECORDER_STATE")
+                 or os.path.join(os.path.dirname(DEFAULT_LOG), "recorder_state.json"))
+# The recorder's state-file format version (backend/activity_recorder.py
+# STATE_VERSION; the two halves share no code). Any other version is ignored.
+_STATE_VERSION = 1
+# An open session older than this is a stale file (recorder down), not a live timer.
+LIVE_MAX_S = 24 * 3600
 
 
 # --------------------------------------------------------------------------- #
@@ -125,6 +133,49 @@ def load_records(path=DEFAULT_LOG):
             rec["activity"] = card_map.get(cid) or rec.get("activity") or cid
             records.append(rec)
     return records
+
+
+def load_live_session(path=DEFAULT_STATE, now=None):
+    """The session the recorder has open right now, or None.
+
+    Read from the recorder's state file, whose ``open`` entry is set exactly while
+    a timer is accruing time — including flow overtime, where work has expired
+    but the break hasn't started (``overtime``). Rest sessions return None, as the
+    dashboard hides rest everywhere. So does anything unreadable, a format version
+    we don't know, or a session older than LIVE_MAX_S (the file outlived the
+    recorder). ``now`` is an aware datetime, default the current time.
+
+    Returns ``activity`` (resolved like `load_records`), ``start_local`` (aware),
+    ``logical_day``, ``elapsed_s``, ``overtime`` and ``partial``.
+    """
+    try:
+        with open(path) as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict) or data.get("version") != _STATE_VERSION:
+        return None
+    o = data.get("open")
+    if not isinstance(o, dict) or o.get("phase") == "rest":
+        return None
+    start_ms = o.get("start_ms")
+    if not isinstance(start_ms, (int, float)):
+        return None
+    start = dt.datetime.fromtimestamp(start_ms / 1000, tz=dt.timezone.utc).astimezone()
+    now = now or dt.datetime.now().astimezone()
+    # The start is the bar's snapshot time; allow its clock to run slightly ahead.
+    elapsed = (now - start).total_seconds()
+    if not -300 <= elapsed < LIVE_MAX_S:
+        return None
+    cid = o.get("card_id")
+    return {
+        "activity": load_card_map().get(cid) or o.get("key") or cid,
+        "start_local": start,
+        "logical_day": logical_day(start),
+        "elapsed_s": max(0.0, elapsed),
+        "overtime": data.get("overtime_start_ms") is not None,
+        "partial": bool(o.get("partial")),
+    }
 
 
 # --------------------------------------------------------------------------- #
