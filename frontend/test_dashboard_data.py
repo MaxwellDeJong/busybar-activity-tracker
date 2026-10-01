@@ -270,5 +270,84 @@ class StackedBarTests(unittest.TestCase):
         self.assertEqual(list(work.text), ["", "work"])
 
 
+class DayViewTests(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        import dashboard_theme as theme
+        self.tmp = tempfile.TemporaryDirectory()
+        self.df = dd.load_prepared(write_fixture(self.tmp.name))
+        self.colors = theme.activity_colors(self.df["activity"].unique())
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def summarize(self, day=D21, now=None):
+        import dashboard_day as day_view
+        return day_view.summarize_day(dd.day_sessions(self.df, day), day, self.colors, now=now)
+
+    def test_summary_totals_and_breakdown(self):
+        s = self.summarize()
+        # dev 16:00 (2m) + 17:00 (3m), work 18:00 (5m).
+        self.assertEqual(s["count"], 3)
+        self.assertAlmostEqual(s["total_s"], 600.0)
+        self.assertEqual([a["activity"] for a in s["activities"]], ["development", "work"])
+        self.assertAlmostEqual(s["activities"][0]["share"], 0.5)
+        self.assertEqual(s["activities"][0]["count"], 2)
+        self.assertEqual(s["first_start"], dt.datetime(2026, 7, 21, 16, 0))
+        self.assertEqual(s["last_end"], dt.datetime(2026, 7, 21, 18, 5))
+
+    def test_items_interleave_gaps(self):
+        kinds = [(it["kind"], round(it.get("seconds", 0) / 60)) for it in self.summarize()["items"]]
+        # 16:02 -> 17:00 and 17:03 -> 18:00 are both breaks over MIN_GAP_S.
+        self.assertEqual(kinds, [("session", 0), ("gap", 58), ("session", 0),
+                                 ("gap", 57), ("session", 0)])
+
+    def test_ribbon_zooms_to_worked_hours(self):
+        s = self.summarize()
+        # 16:00..19:00 is 3 h under the 6 h minimum: 1 h earlier, 2 h later.
+        self.assertEqual(s["window"], (dt.datetime(2026, 7, 21, 15), dt.datetime(2026, 7, 21, 21)))
+        self.assertEqual([t.hour for t in s["ticks"]], list(range(15, 22)))
+
+    def test_ribbon_extends_to_now_and_clamps_to_day(self):
+        import dashboard_day as day_view
+        now = dt.datetime(2026, 7, 22, 1, 30)            # still logical 7/21
+        s = self.summarize(now=now)
+        self.assertEqual(s["window"][1], dt.datetime(2026, 7, 22, 2))
+        # A session right after the 03:00 cutoff can't pull the window before it.
+        lo, hi = day_view._ribbon_window(D21, dt.datetime(2026, 7, 21, 3, 10),
+                                         dt.datetime(2026, 7, 21, 3, 40))
+        self.assertEqual((lo, hi), (dt.datetime(2026, 7, 21, 3), dt.datetime(2026, 7, 21, 9)))
+
+    def test_empty_day(self):
+        import dashboard_day as day_view
+        self.assertIsNone(self.summarize(day=D22))
+        page = day_view.render_day_html(None, D22, D22, "UTC")
+        self.assertIn("Nothing tracked", page)
+
+    def test_html_escapes_and_prettifies_names(self):
+        import pandas as pd
+        import dashboard_day as day_view
+        sessions = pd.DataFrame([{
+            "activity": "<b>tech_reading</b>", "duration_s": 600.0,
+            "start_local": dt.datetime(2026, 7, 21, 9, 0, tzinfo=dt.timezone.utc),
+        }])
+        s = day_view.summarize_day(sessions, D21, {})
+        page = day_view.render_day_html(s, D21, D21, "UTC")
+        self.assertNotIn("<b>", page)
+        self.assertIn("&lt;b&gt;tech reading&lt;/b&gt;", page)
+        self.assertEqual(day_view.pretty_name("tech_reading"), "Tech reading")
+
+    def test_relative_labels(self):
+        import dashboard_day as day_view
+        today = dt.date(2026, 9, 30)
+        label = lambda d: day_view._relative_label(d, today)   # noqa: E731
+        self.assertEqual(label(today), "Today")
+        self.assertEqual(label(dt.date(2026, 9, 29)), "Yesterday")
+        self.assertEqual(label(dt.date(2026, 9, 26)), "4 days ago")
+        self.assertEqual(label(dt.date(2026, 9, 21)), "Last week")
+        self.assertEqual(label(dt.date(2026, 9, 2)), "4 weeks ago")
+        self.assertEqual(label(dt.date(2026, 1, 5)), "8 months ago")
+
+
 if __name__ == "__main__":
     unittest.main()
