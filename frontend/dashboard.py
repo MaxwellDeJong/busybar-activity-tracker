@@ -413,10 +413,14 @@ _page_component = st.components.v2.component(
 # --------------------------------------------------------------------------- #
 # Data loading (cached, invalidated when the log file changes)                #
 # --------------------------------------------------------------------------- #
-@st.cache_data(show_spinner=False)
-def load_prepared(path, _mtime):
-    """Cached prepared frame. `_mtime` is part of the cache key so any write to the
-    log invalidates it on the next run; the value itself is unused."""
+@st.cache_data(show_spinner=False, max_entries=2)
+def load_prepared(path, mtime):
+    """Cached prepared frame. `mtime` is part of the cache key so any write to the
+    log invalidates it on the next run; the value itself is unused.
+
+    It must not start with an underscore: Streamlit leaves `_`-prefixed arguments
+    out of the cache key, which silently pinned the log as first read. Each write
+    makes a new entry, so only the latest couple are kept."""
     return dd.load_prepared(path)
 
 
