@@ -76,27 +76,42 @@ def _ticks(lo, hi):
     return out
 
 
-def summarize_day(sessions, day, color_map, now=None):
+def summarize_day(sessions, day, color_map, now=None, live=None):
     """Shape one logical day's sessions into what the Day view renders.
 
     ``sessions`` is `dashboard_data.day_sessions` output (sorted by start).
-    ``now`` is a naive local datetime, used only to place the ribbon's now-marker.
+    ``now`` is a naive local datetime, used to place the ribbon's now-marker.
+    ``live`` is `dashboard_data.load_live_session` output for a timer running on
+    this day (the caller checks the day); it joins the day as one more session
+    ending at ``now`` and flagged ``live``, so totals, ribbon, breakdown and list
+    all include the time so far.
+
     Returns None for an empty day, else a dict with ``total_s``, ``count``,
     ``first_start``/``last_end``, ``activities`` (desc by time, each with share),
-    ``items`` (sessions interleaved with ``gap`` rows of at least MIN_GAP_S), and the
-    ribbon window/ticks.
+    ``items`` (sessions interleaved with ``gap`` rows of at least MIN_GAP_S),
+    ``live`` (the live row or None), and the ribbon window/ticks.
     """
-    if sessions is None or sessions.empty:
+    has_logged = sessions is not None and not sessions.empty
+    if not has_logged and live is None:
         return None
 
     rows = []
-    for _, r in sessions.iterrows():
+    for _, r in (sessions.iterrows() if has_logged else ()):
         start = _naive(r["start_local"])
         end = start + dt.timedelta(seconds=float(r["duration_s"]))
         act = r["activity"]
         rows.append({"activity": act, "start": start, "end": end,
                      "duration_s": float(r["duration_s"]),
                      "color": color_map.get(act, theme.OTHER_COLOR)})
+    live_row = None
+    if live is not None:
+        start = _naive(live["start_local"])
+        end = max(now or start, start)
+        live_row = {"activity": live["activity"], "start": start, "end": end,
+                    "duration_s": (end - start).total_seconds(),
+                    "color": color_map.get(live["activity"], theme.OTHER_COLOR),
+                    "live": True, "overtime": live["overtime"]}
+        rows.append(live_row)
     rows.sort(key=lambda s: s["start"])
 
     total_s = sum(s["duration_s"] for s in rows)
@@ -115,7 +130,7 @@ def summarize_day(sessions, day, color_map, now=None):
     return {
         "total_s": total_s, "count": len(rows), "sessions": rows,
         "first_start": first_start, "last_end": last_end,
-        "activities": activities, "items": items,
+        "activities": activities, "items": items, "live": live_row,
         "window": (lo, hi), "ticks": _ticks(lo, hi),
     }
 
@@ -163,10 +178,12 @@ def _ribbon(summary, now):
     for i, s in enumerate(summary["sessions"]):
         left = _pct(s["start"], lo, span_s)
         width = _pct(s["end"], lo, span_s) - left
-        tip = (f'{pretty_name(s["activity"])} · {_clock(s["start"])}–{_clock(s["end"])}'
+        end = "now" if s.get("live") else _clock(s["end"])
+        tip = (f'{pretty_name(s["activity"])} · {_clock(s["start"])}–{end}'
                f' · {dd.fmt_duration(s["duration_s"], "minute")}')
+        cls = "bb-seg is-live" if s.get("live") else "bb-seg"
         segs.append(
-            f'<button type="button" class="bb-seg" data-bb-session="{i}" title="{h.esc(tip)}" '
+            f'<button type="button" class="{cls}" data-bb-session="{i}" title="{h.esc(tip)}" '
             f'aria-label="{h.esc(tip)}" '
             f'style="left:{left:.3f}%;width:{width:.3f}%;background:{s["color"]}"></button>'
         )
@@ -192,16 +209,30 @@ def _session_list(summary):
             out.append(f'<li class="bb-gap"><span>{dd.fmt_duration(it["seconds"], "minute")} '
                        'break</span></li>')
             continue
+        live = it.get("live")
         out.append(
-            f'<li class="bb-sess" id="bb-session-{it["index"]}" '
+            f'<li class="bb-sess{" is-live" if live else ""}" id="bb-session-{it["index"]}" '
             f'style="--c:{it["color"]}">'
             f'<span class="bb-sess-time">{_clock(it["start"])}<span class="bb-sess-end">'
-            f'{_clock(it["end"])}</span></span>'
+            f'{"now" if live else _clock(it["end"])}</span></span>'
             f'<span class="bb-sess-name">{h.esc(pretty_name(it["activity"]))}</span>'
             f'<span class="bb-sess-dur">{dd.fmt_duration(it["duration_s"], "minute")}</span>'
             '</li>'
         )
     return f'<ol class="bb-sessions">{"".join(out)}</ol>'
+
+
+def _live_banner(live):
+    """'● Work · running since 22:27 ……… 34m' for the timer that is running now."""
+    if live is None:
+        return ""
+    state = "in overtime" if live["overtime"] else "running"
+    return (f'<div class="bb-live" style="--c:{live["color"]}" role="status">'
+            '<span class="bb-pulse" aria-hidden="true"></span>'
+            f'<span class="bb-live-text"><b>{h.esc(pretty_name(live["activity"]))}</b> · '
+            f'{state} since {_clock(live["start"])}</span>'
+            f'<span class="bb-live-dur">{dd.fmt_duration(live["duration_s"], "minute")}</span>'
+            '</div>')
 
 
 def render_day_html(summary, day, today, tzname, now=None):
@@ -217,10 +248,12 @@ def render_day_html(summary, day, today, tzname, now=None):
     facts = [
         h.plural(summary["count"], "session"),
         h.plural(len(summary["activities"]), "activity", "activities"),
-        f'{_clock(summary["first_start"])} – {_clock(summary["last_end"])}',
+        f'{_clock(summary["first_start"])} – '
+        f'{"now" if summary["live"] else _clock(summary["last_end"])}',
     ]
     return h.page(
         h.hero(eyebrow, title, summary["total_s"], facts)
+        + _live_banner(summary["live"])
         + h.card("Timeline", _ribbon(summary, now))
         + '<div class="bb-cols">'
         + h.card("By activity", h.breakdown(summary["activities"]))

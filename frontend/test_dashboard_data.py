@@ -379,5 +379,88 @@ class DayViewTests(unittest.TestCase):
         self.assertEqual(label(dt.date(2026, 1, 5)), "8 months ago")
 
 
+class LiveSessionTests(unittest.TestCase):
+    """The recorder's open session (recorder_state.json) as the Day view sees it."""
+
+    NOW = dt.datetime(2026, 7, 21, 18, 30, tzinfo=dt.timezone.utc)
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.TemporaryDirectory()
+        self.path = os.path.join(self.tmp.name, "recorder_state.json")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def write_state(self, open_=None, version=1, overtime_ms=None, start=None):
+        import json
+        start = start or dt.datetime(2026, 7, 21, 18, 10, tzinfo=dt.timezone.utc)
+        if open_ is None:
+            open_ = {"key": "work", "phase": "work", "index": 0, "card_id": "test-card",
+                     "start_ms": int(start.timestamp() * 1000), "partial": False}
+        with open(self.path, "w") as fh:
+            json.dump({"open": open_, "overtime_start_ms": overtime_ms, "observed_stop": True,
+                       "version": version, "last_ts_ms": 0, "saved_at": 0}, fh)
+
+    def load(self):
+        return dd.load_live_session(self.path, now=self.NOW)
+
+    def test_open_session(self):
+        self.write_state()
+        live = self.load()
+        self.assertEqual(live["activity"], "work")       # unmapped card -> recorder's key
+        self.assertEqual(live["logical_day"], D21)
+        self.assertAlmostEqual(live["elapsed_s"], 20 * 60)
+        self.assertFalse(live["overtime"])
+
+    def test_flow_overtime_still_counts(self):
+        self.write_state(overtime_ms=1)
+        self.assertTrue(self.load()["overtime"])
+
+    def test_nothing_running(self):
+        self.write_state(open_=False)
+        self.assertIsNone(self.load())
+        self.assertIsNone(dd.load_live_session(os.path.join(self.tmp.name, "missing.json")))
+
+    def test_rest_unknown_version_and_stale_are_ignored(self):
+        self.write_state(open_={"key": "work", "phase": "rest", "start_ms": 0})
+        self.assertIsNone(self.load())
+        self.write_state(version=2)
+        self.assertIsNone(self.load())
+        self.write_state(start=self.NOW - dt.timedelta(hours=30))
+        self.assertIsNone(self.load())
+
+    def test_day_view_includes_live_session(self):
+        import tempfile
+        import dashboard_day as day_view
+        import dashboard_theme as theme
+        with tempfile.TemporaryDirectory() as tmp:
+            df = dd.load_prepared(write_fixture(tmp))
+        colors = theme.activity_colors(df["activity"].unique())
+        self.write_state()
+        live = self.load()
+        now = self.NOW.replace(tzinfo=None)
+        s = day_view.summarize_day(dd.day_sessions(df, D21), D21, colors, now=now, live=live)
+        # 10m logged + 20m running; the live row is last and ends at now.
+        self.assertAlmostEqual(s["total_s"], 1800.0)
+        self.assertEqual(s["count"], 4)
+        self.assertTrue(s["items"][-1]["live"])
+        self.assertEqual(s["last_end"], now)
+        work = next(a for a in s["activities"] if a["activity"] == "work")
+        self.assertAlmostEqual(work["seconds"], 1500.0)
+        page = day_view.render_day_html(s, D21, D21, "UTC", now=now)
+        self.assertIn("bb-live", page)
+        self.assertIn("running since 18:10", page)
+        self.assertIn("16:00 – now", page)
+
+    def test_live_session_alone_fills_an_empty_day(self):
+        import dashboard_day as day_view
+        self.write_state()
+        now = self.NOW.replace(tzinfo=None)
+        s = day_view.summarize_day(None, D21, {}, now=now, live=self.load())
+        self.assertEqual(s["count"], 1)
+        self.assertAlmostEqual(s["total_s"], 1200.0)
+
+
 if __name__ == "__main__":
     unittest.main()
