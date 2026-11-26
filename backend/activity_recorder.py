@@ -20,6 +20,17 @@ given activity and phase. It ends when the timer stops running (pause, abandon,
 completion) or the activity/phase changes. The end timestamp is the moment the
 timer stopped running (Request 1).
 
+Missed intervals
+----------------
+The bar publishes each snapshot once and never re-sends it, so one published
+into a dead connection is gone (e.g. 2026-11-23: a power cut left the bar on a
+half-open socket and its work-start press was lost). The interval index exposes
+this: an interval session is a continuation only if the *index* matches, not
+just the phase, so rest 1 → rest 3 is never mistaken for one long rest. When
+the index skips, the missing intervals are filled in at the bar's configured
+work/rest lengths (`interval_settings`), anchored to end where the next observed
+interval starts, and the affected records carry `"estimated": true`.
+
 Restart durability (--state)
 ----------------------------
 The open session lives in memory, but the bar publishes a snapshot only when the
@@ -67,6 +78,12 @@ RUNNING_TYPES = ("INFINITE", "SIMPLE", "INTERVAL")
 # rather than misread (a lost resume costs one session, a misread corrupts one).
 STATE_VERSION = 1
 
+# Firmware defaults for interval length (docs/firmware-activity-selection-plan.md),
+# used to fill a skipped interval only when no snapshot has carried the bar's own
+# `interval_settings`.
+DEFAULT_WORK_MS = 25 * 60 * 1000
+DEFAULT_REST_MS = 5 * 60 * 1000
+
 # How long the recorder may be down and still resume the session it had open.
 # Generous enough for a rebuild or a host reboot, short enough that a real
 # outage — where the stop we never saw could be anywhere in the gap — falls back
@@ -99,9 +116,13 @@ def derive_state(snap: dict, card_id_map: dict) -> dict:
 
     running = (snap_type in RUNNING_TYPES) and not is_paused
 
+    work_ms = rest_ms = None
     if snap_type == "INTERVAL":
         index = int(snap.get("current_interval", 0))
         phase = "work" if index % 2 == 0 else "rest"
+        settings = snap.get("interval_settings") or {}
+        work_ms = _positive_int(settings.get("interval_work_ms"))
+        rest_ms = _positive_int(settings.get("interval_rest_ms"))
     elif snap_type in ("SIMPLE", "INFINITE"):
         index = None
         phase = "focus"
@@ -118,7 +139,19 @@ def derive_state(snap: dict, card_id_map: dict) -> dict:
         "index": index,
         "card_id": card_id,
         "type": snap_type,
+        # Configured interval lengths (INTERVAL only; None if absent). Used to
+        # estimate intervals whose snapshots never arrived — see _fill_gap.
+        "work_ms": work_ms,
+        "rest_ms": rest_ms,
     }
+
+
+def _positive_int(v) -> int | None:
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
 
 
 def _iso(ms: int) -> str:
@@ -156,7 +189,7 @@ class SessionTracker:
         self.overtime_start_ms = st.get("overtime_start_ms")
         self._observed_stop = bool(st.get("observed_stop", False))
 
-    def _open(self, st: dict, ts_ms: int) -> None:
+    def _open(self, st: dict, ts_ms: int, estimated: bool = False) -> None:
         self.open = {
             "key": st["key"],
             "phase": st["phase"],
@@ -166,7 +199,13 @@ class SessionTracker:
             # A session opened before we ever observed a stopped state may have
             # begun before the recorder connected: its start time is unreliable.
             "partial": not self._observed_stop,
+            # Remembered so a later gap can still be filled if the snapshot that
+            # reveals it lacks interval_settings.
+            "work_ms": st.get("work_ms"),
+            "rest_ms": st.get("rest_ms"),
         }
+        if estimated:
+            self.open["estimated"] = True
 
     def _close(self, ts_ms: int, overtime_ms: int = 0, truncated: bool = False) -> dict:
         o = self.open
@@ -187,6 +226,10 @@ class SessionTracker:
         }
         if self.flow_overtime and o["phase"] == "work":
             record["overtime_s"] = round(max(0, overtime_ms) / 1000, 1)
+        if o.get("estimated"):
+            # At least one boundary was inferred from configured interval lengths
+            # rather than observed (see _fill_gap). Absent on observed records.
+            record["estimated"] = True
         self.open = None
         self.overtime_start_ms = None
         return record
@@ -198,6 +241,52 @@ class SessionTracker:
             return []
         overtime = ts_ms - self.overtime_start_ms if self.overtime_start_ms else 0
         return [self._close(ts_ms, overtime_ms=overtime, truncated=True)]
+
+    def _fill_gap(self, st: dict, ts_ms: int) -> list[dict]:
+        """Estimate intervals whose snapshots never arrived.
+
+        Called when the snapshot at `ts_ms` shows interval j of the open
+        session's block but the open session is interval i < j - 1: intervals
+        i+1 … j-1 happened unseen (e.g. the bar published into a dead connection).
+        Each missing interval gets its configured length, packed back-to-back so
+        the last one ends at `ts_ms`, the start of interval j, which is the one
+        boundary we did see. The open interval absorbs whatever time remains,
+        since its real end is the unknown. If the configured lengths don't fit
+        in the span, the span is shared out in proportion to them instead
+        (open interval included), so nothing extends outside what we observed.
+
+        Closes the open interval and all but the last missing one, and leaves
+        the last missing interval *open*, flagged estimated, so the caller's
+        normal transition logic (including flow overtime) handles interval j.
+        """
+        o = self.open
+        assert o is not None
+        work_ms = st.get("work_ms") or o.get("work_ms") or DEFAULT_WORK_MS
+        rest_ms = st.get("rest_ms") or o.get("rest_ms") or DEFAULT_REST_MS
+
+        def length(idx: int) -> int:
+            return work_ms if idx % 2 == 0 else rest_ms
+
+        missing = list(range(o["index"] + 1, st["index"]))
+        lengths = [length(k) for k in missing]
+        span = ts_ms - o["start_ms"]
+        if sum(lengths) > span:
+            total = length(o["index"]) + sum(lengths)
+            lengths = [span * n // total for n in lengths]
+
+        settings = {"work_ms": work_ms, "rest_ms": rest_ms}
+        t = ts_ms - sum(lengths)
+        overtime = t - self.overtime_start_ms if self.overtime_start_ms else 0
+        o["estimated"] = True
+        out = [self._close(t, overtime_ms=overtime)]
+        for k, n in zip(missing, lengths):
+            if self.open is not None:  # the previous missing interval ends here
+                out.append(self._close(t))
+            phase = "work" if k % 2 == 0 else "rest"
+            self._open(dict(st, phase=phase, index=k, **settings), t, estimated=True)
+            self.open["partial"] = False  # its start is estimated, not unseen
+            t += n
+        return out
 
     def on_snapshot(self, snap: dict, ts_ms: int) -> list[dict]:
         """Feed one snapshot; return any sessions completed by it (0 or 1)."""
@@ -215,8 +304,26 @@ class SessionTracker:
         o = self.open
         same_activity = st["key"] == o["key"]
 
-        # Still the same running session → just note it and continue.
-        if st["running"] and same_activity and st["phase"] == o["phase"]:
+        # Interval(s) skipped since the open one → estimate them, leaving the last
+        # missing interval open, then fall through to treat this snapshot as a
+        # normal transition out of it.
+        if (
+            same_activity
+            and o["index"] is not None
+            and st["index"] is not None
+            and st["index"] > o["index"] + 1
+        ):
+            out.extend(self._fill_gap(st, ts_ms))
+            o = self.open
+
+        # Still the same running session → just note it and continue. The index
+        # must match too: rest 1 → rest 3 is a new session, not a continuation.
+        if (
+            st["running"]
+            and same_activity
+            and st["phase"] == o["phase"]
+            and st["index"] == o["index"]
+        ):
             return out
 
         if self.flow_overtime and o["phase"] == "work" and same_activity and st["phase"] == "rest":
@@ -262,6 +369,7 @@ class SessionWriter:
                 else ""
             )
             + ("  [partial]" if record.get("partial") else "")
+            + ("  [estimated: interval snapshot missed]" if record.get("estimated") else "")
         )
 
 
@@ -512,7 +620,8 @@ def run_mqtt(
 # ---------------------------------------------------------------------------
 # Offline self-test — validates the session logic without hardware
 # ---------------------------------------------------------------------------
-def _snap(t, card_id="ID2", paused=False, index=0, left=1500000, total=1500000):
+def _snap(t, card_id="ID2", paused=False, index=0, left=1500000, total=1500000,
+          work_ms=None, rest_ms=None):
     s = {"type": t, "card_id": card_id, "is_paused": paused}
     if t == "INTERVAL":
         s.update(
@@ -520,6 +629,13 @@ def _snap(t, card_id="ID2", paused=False, index=0, left=1500000, total=1500000):
             current_interval_time_left_ms=left,
             current_interval_time_total_ms=total,
         )
+        if work_ms is not None:
+            s["interval_settings"] = {
+                "interval_work_ms": work_ms,
+                "interval_rest_ms": rest_ms,
+                "interval_work_cycles_count": 4,
+                "is_autostart_enabled": False,
+            }
     elif t == "SIMPLE":
         s["time_left_ms"] = left
     return s
@@ -712,6 +828,88 @@ def self_test() -> int:
     res = revived.on_snapshot(_snap("INTERVAL", index=1), 1700 * S)  # break started
     check("overtime clock survives a restart",
           [(r["duration_s"], r.get("overtime_s")) for r in res], [(1690.0, 200.0)])
+
+    # 14. Missed intervals (the 2026-11-23 shape). Work 0 → rest 1 observed; the
+    # work 2 start is lost; rest 3 then arrives. Work 2 gets its configured
+    # length ending at rest 3's start; rest 1 absorbs the rest of the span.
+    M = 60 * S
+    cfg = dict(work_ms=35 * M, rest_ms=5 * M)
+    iv = lambda i, **kw: _snap("INTERVAL", index=i, **cfg, **kw)  # noqa: E731
+    seq = [
+        (_snap("NOT_STARTED"), 0),
+        (iv(0), 0),
+        (iv(1, paused=True), 35 * M),  # work expired → waiting
+        (iv(1), 40 * M),               # break starts
+        # (work 2 started ~48 min: snapshot lost)
+        (iv(3), 90 * M),               # break 3 starts
+        (iv(4), 96 * M),               # work 4 starts
+    ]
+    res = _run(seq, flow=True)
+    check(
+        "gap: rest 1 → rest 3 fills work 2 at configured length",
+        [(r["phase"], r["interval_index"], r["duration_s"], r.get("estimated", False))
+         for r in res],
+        [("work", 0, 2400.0, False), ("rest", 1, 900.0, True),
+         ("work", 2, 2100.0, True), ("rest", 3, 360.0, False)],
+    )
+    check("gap: estimated work keeps the flow-mode overtime field",
+          res[2].get("overtime_s"), 0.0)
+    check("gap: records stay contiguous",
+          all(a["end"] == b["start"] for a, b in zip(res, res[1:])), True)
+
+    # Without the index check, rest 3 was swallowed as a continuation of rest 1.
+    res = _run(seq[:5] + [(iv(3, paused=True), 95 * M)], flow=False)
+    check("gap: same phase, new index is not a continuation",
+          [(r["phase"], r["interval_index"]) for r in res],
+          [("work", 0), ("rest", 1), ("work", 2), ("rest", 3)])
+
+    # Two missing intervals (rest 1 → work 4): both get configured lengths.
+    res = _run(seq[:4] + [(iv(4), 100 * M), (iv(4, paused=True), 110 * M)], flow=False)
+    check(
+        "gap: rest 1 → work 4 fills work 2 and rest 3",
+        [(r["phase"], r["interval_index"], r["duration_s"]) for r in res],
+        [("work", 0, 2100.0), ("rest", 1, 1200.0), ("work", 2, 2100.0),
+         ("rest", 3, 300.0), ("work", 4, 600.0)],
+    )
+
+    # Span too short for the configured lengths (rapid skips the firmware's
+    # debounce collapsed): share the span by those lengths, open interval included.
+    res = _run(
+        [(_snap("NOT_STARTED"), 0), (iv(1), 0), (iv(3), 80 * S), (iv(3, paused=True), 90 * S)],
+        flow=False,
+    )
+    check(
+        "gap: short span is shared proportionally",
+        [(r["phase"], r["duration_s"]) for r in res],
+        [("rest", 10.0), ("work", 70.0), ("rest", 10.0)],
+    )
+
+    # No interval_settings anywhere → firmware defaults (25 / 5 min).
+    bare = lambda i, **kw: _snap("INTERVAL", index=i, **kw)  # noqa: E731
+    res = _run([(_snap("NOT_STARTED"), 0), (bare(1), 0), (bare(3), 60 * M)], flow=False)
+    check("gap: falls back to firmware default lengths",
+          [(r["phase"], r["duration_s"]) for r in res], [("rest", 2100.0), ("work", 1500.0)])
+
+    # A new block (index drops back to 0) is a normal transition, not a gap.
+    res = _run([(_snap("NOT_STARTED"), 0), (iv(5), 0), (iv(0), 10 * M)], flow=False)
+    check("new block is not treated as a gap",
+          [(r["phase"], r["interval_index"], r.get("estimated", False)) for r in res],
+          [("rest", 5, False)])
+
+    # Flow mode: the gap is revealed by "rest 3 waiting", so the estimated work 2
+    # stays open in overtime; it survives a restart and closes estimated, with
+    # overtime counted from the waiting snapshot.
+    tr = SessionTracker({"ID2": "tech_reading"}, flow_overtime=True)
+    for snap, ts in seq[:4]:
+        tr.on_snapshot(snap, ts)
+    tr.on_snapshot(iv(3, paused=True), 90 * M)  # work 2 expired unseen → waiting
+    revived = SessionTracker({"ID2": "tech_reading"}, flow_overtime=True)
+    revived.load_state(json.loads(json.dumps(tr.to_state())))
+    res = revived.on_snapshot(iv(3), 93 * M)    # break 3 starts
+    check("estimated open session survives a restart",
+          [(r["phase"], r["interval_index"], r["duration_s"], r.get("overtime_s"),
+            r.get("estimated")) for r in res],
+          [("work", 2, 2280.0, 180.0, True)])
 
     # 12. plan_resume weighs downtime, not session length.
     fresh = {"open": {"key": "x"}, "saved_at": 1000.0}
